@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AgileX Remote</string>
+    <string name="reload">Reload</string>
+    <string name="settings">Settings</string>
+    <string name="settings_title">Robot server</string>
+    <string name="settings_help">Base URL of the robot\'s remote server. The robot\'s IP is DHCP and changes, so use \"Find robot\" below rather than editing this by hand. Accepts a bare host:port too (e.g. ROBOT_IP:8765).</string>
+    <string name="base_url_label">Base URL</string>
+    <string name="base_url_hint">http://ROBOT_IP:8765/</string>
+    <string name="save_and_load">Save &amp; Load</string>
+    <string name="use_default">Use default</string>
+    <string name="cancel">Cancel</string>
+
+    <string name="discovery_title">Find robot automatically</string>
+    <string name="discovery_help">The robot publishes its current IP to an ntfy.sh topic on boot and every 5 minutes, so it can still be found after its DHCP address changes. \"Find robot\" reads the newest message and loads that address.</string>
+    <string name="topic_label">ntfy.sh topic</string>
+    <string name="find_robot">Find robot</string>
+</resources>

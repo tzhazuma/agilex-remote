@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive-icon foreground: a joystick glyph in the controller UI's accent colour
+  (#4FC3F7). Kept inside the central 72x72dp safe zone (18..90) so no launcher
+  mask clips it, and built from thick shapes so it stays legible at 48dp.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- joystick ball (circle drawn as two half arcs) -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M40,41 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0 z" />
+
+    <!-- stick -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M50,48h8v24h-8z" />
+
+    <!-- base plate -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M30,74h48v9h-48z" />
+
+    <!-- two grip ticks, echoing the controller's direction pads -->
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M20,56h6v14h-6z" />
+    <path
+        android:fillColor="#4FC3F7"
+        android:pathData="M82,56h6v14h-6z" />
+</vector>

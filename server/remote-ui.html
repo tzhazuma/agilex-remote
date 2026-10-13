@@ -1,0 +1,2011 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover for notched phones. Deliberately NO user-scalable=no:
+     pinch-zoom stays available (accessibility). -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>AgileX Remote Controller</title>
+<!--
+  AgileX virtual remote controller - single self-contained file.
+  Served by the robot's Python server; opened through an SSH tunnel.
+
+  NO external resources of any kind: no CDNs, no web fonts, no images, no
+  absolute URLs. Every endpoint below is same-origin and root-relative, so the
+  page works fully offline and behind a tunnel.
+
+  Endpoints used (exactly the frozen contract, nothing invented):
+    GET  /api/status          polled at 4 Hz. Returns `arms` (array, [left,right])
+                              plus the legacy `arm` (= arms[0]) for compatibility.
+    POST /api/drive           {"lin":..,"ang":..} at ~10 Hz while held, zeros on release
+    POST /api/arm             {"joint":0-5,"delta_deg":..,"arm":0|1}
+    POST /api/arm/enable      {"enable":true|false,"arm":0|1}
+    POST /api/gripper         {"delta_deg":..,"arm":0|1}
+    POST /api/arm/reset       {"arm":0|1}  clears the latched motion fault,
+                              re-enables, and re-syncs the commanded target to the
+                              MEASURED position. Causes NO motion.
+    POST /api/arm/home        {"arm":0|1}  commands the arm back to `home_deg`.
+                              THIS MOVES THE ARM - gated behind an inline confirm.
+    POST /api/estop           (no body) -> disables BOTH arms
+    POST /api/estop/clear     (no body)
+    GET  /video?cam=0 (LEFT ARM CAMERA) and /video?cam=2 (RIGHT ARM CAMERA) as <img> MJPEG
+
+  TWO ARMS: `arm` is 0 = LEFT (can_left, the default) and 1 = RIGHT (can_right).
+  Omitting the field is still valid and means the left arm, exactly as before, so
+  this page also works against a server that predates the `arms` array.
+
+  SIGN CONVENTION (assumption, ROS REP-103): +lin = forward, +ang = turn LEFT
+  (counter-clockwise seen from above). Keyboard A/ArrowLeft, D-pad LEFT and
+  virtual-stick-left all produce +ang; D/ArrowRight and stick-right produce -ang.
+
+  INPUT COMPOSITION RULE: all four input methods write into their own slot in
+  `sources` and a single combiner takes, PER AXIS, the value with the LARGER
+  ABSOLUTE MAGNITUDE (sign preserved). So keyboard + gamepad held together do
+  not sum into a faster command, and neither input can cancel the other by
+  sitting at zero. One pipeline, one sender, one place that can command motion.
+-->
+<style>
+  :root{
+    --bg:#0a0e13; --panel:#121a23; --panel2:#0f161d; --line:#243240;
+    --fg:#e8eef5; --muted:#8fa3b6; --dim:#5f7285;
+    --accent:#4da3ff; --ok:#2fd07f; --warn:#ffb020; --bad:#ff4d4f; --bad-dim:#5a1b1d;
+    --r:12px; --tap:44px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg); font-family:var(--sans);
+    font-size:15px; line-height:1.35;
+    /* svh (not vh): stable against mobile browser chrome show/hide */
+    min-height:100svh;
+    -webkit-text-size-adjust:100%;
+    -webkit-tap-highlight-color:transparent;
+    overscroll-behavior-y:contain;
+  }
+  button,input,select{font:inherit;color:inherit}
+  button{
+    background:var(--panel2); border:1px solid var(--line); border-radius:10px;
+    min-height:var(--tap); min-width:var(--tap); padding:8px 12px; cursor:pointer;
+    touch-action:manipulation; user-select:none; -webkit-user-select:none;
+  }
+  button:active{background:#1d2a37}
+  button[disabled]{opacity:.45; cursor:not-allowed}
+  button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  .mono{font-family:var(--mono)}
+
+  /* ---------- sticky top: safety banner + E-STOP, always visible ---------- */
+  .sticky{
+    position:sticky; top:0; z-index:50; background:rgba(10,14,19,.97);
+    border-bottom:1px solid var(--line);
+    padding-top:env(safe-area-inset-top);
+  }
+  .topbar{display:flex; align-items:center; gap:10px; padding:8px 12px; flex-wrap:wrap}
+  .brand{font-weight:700; letter-spacing:.02em}
+  .brand small{display:block; font-weight:400; color:var(--muted); font-size:11px; letter-spacing:.06em}
+  .grow{flex:1 1 auto}
+  .pill{
+    display:inline-flex; align-items:center; gap:6px; padding:5px 10px; border-radius:999px;
+    font-size:12px; font-weight:700; letter-spacing:.04em; border:1px solid var(--line);
+    background:var(--panel2); white-space:nowrap;
+  }
+  .pill::before{content:""; width:8px; height:8px; border-radius:50%; background:currentColor}
+  .pill.ok{color:var(--ok)} .pill.warn{color:var(--warn)} .pill.bad{color:var(--bad)}
+  .estop{
+    background:var(--bad); border:2px solid #ff8a8c; color:#fff; font-weight:800;
+    font-size:17px; letter-spacing:.06em; min-height:56px; padding:10px 18px;
+    box-shadow:0 0 0 2px rgba(255,77,79,.25);
+  }
+  .estop:active{background:#d92b2d}
+  .estop[disabled]{background:#3a2224; border-color:#5a2a2c; color:#c9a3a4}
+  .estop-clear{
+    background:#1d2a37; border:2px solid var(--warn); color:var(--warn); font-weight:800;
+    min-height:56px; padding:10px 16px;
+  }
+  .banner{
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:6px 12px;
+    background:linear-gradient(90deg,#3a2a05,#241a04); border-top:1px solid #6b4d09;
+    color:#ffd489; font-size:12.5px;
+  }
+  .banner b{color:#ffe0a8}
+  .banner-note{color:#e8c98a; opacity:.92}
+  .banner-note b{color:#ffe0a8}
+  .lostbar{
+    display:none; padding:8px 12px; background:var(--bad-dim); border-top:1px solid var(--bad);
+    color:#ffd2d3; font-weight:700; font-size:13px;
+  }
+  .lostbar.on{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+  .estopbar{
+    display:none; padding:8px 12px; background:#3a2224; border-top:1px solid var(--bad);
+    color:#ffd2d3; font-weight:700; font-size:13px;
+  }
+  .estopbar.on{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+
+  /* ---------- layout ---------- */
+  .app{
+    padding:12px calc(12px + env(safe-area-inset-right)) calc(20px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+    display:grid; gap:12px;
+    grid-template-columns:1fr;
+    grid-template-areas:"drive" "cams" "arms" "status";
+  }
+  @media (min-width:760px){
+    .app{
+      grid-template-columns:minmax(300px,1fr) minmax(320px,1.2fr);
+      grid-template-areas:"drive cams" "arms arms" "status status";
+    }
+  }
+  @media (min-width:1080px){
+    .app{
+      grid-template-columns:minmax(300px,1fr) minmax(380px,1.5fr) minmax(300px,1fr);
+      grid-template-areas:"drive cams status" "arms arms arms";
+      align-items:start;
+    }
+  }
+  #card-drive{grid-area:drive} #card-cams{grid-area:cams}
+  #card-arms{grid-area:arms} #card-status{grid-area:status}
+  /* The two arm panels get their own full-width row: stacked on phones, side by
+     side from tablet width up. Half of a 300px column would be too narrow for a
+     joint row (44 + value + badge + 2x52), so they must not share the old
+     single `arm` grid cell. */
+  .arms-wrap{display:grid; gap:12px; grid-template-columns:1fr; align-items:start}
+  @media (min-width:760px){ .arms-wrap{grid-template-columns:1fr 1fr} }
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--r);
+    padding:12px; min-width:0;
+  }
+  .card > h2{
+    margin:0 0 10px; font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted);
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .card > h2 .tag{
+    font-size:10.5px; letter-spacing:.04em; text-transform:none; color:var(--dim);
+    border:1px solid var(--line); border-radius:999px; padding:1px 7px; font-weight:400;
+  }
+  .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .row.tight{gap:6px}
+  .sep{height:1px; background:var(--line); margin:12px 0}
+  .hint{color:var(--muted); font-size:12px}
+  .warnbox{
+    border:1px solid #6b4d09; background:#241a04; color:#ffd489; border-radius:10px;
+    padding:8px 10px; font-size:12.5px;
+  }
+
+  /* ---------- drive ---------- */
+  .drive-disabled{opacity:.5; filter:saturate(.4)}
+  .stick-wrap{display:flex; gap:14px; align-items:center; flex-wrap:wrap; justify-content:center}
+  .stick{
+    position:relative; width:min(46vw,210px); height:min(46vw,210px); min-width:150px; min-height:150px;
+    border-radius:50%; background:radial-gradient(circle at 50% 45%,#16212c,#0d141b 70%);
+    border:2px solid var(--line); touch-action:none; user-select:none; -webkit-user-select:none;
+    flex:0 0 auto;
+  }
+  .stick::after{ /* crosshair */
+    content:""; position:absolute; inset:12%; border-radius:50%;
+    border:1px dashed rgba(143,163,182,.18); pointer-events:none;
+  }
+  .puck{
+    position:absolute; left:50%; top:50%; width:66px; height:66px; margin:-33px 0 0 -33px;
+    border-radius:50%; background:linear-gradient(180deg,#2b6fb5,#1d4f83);
+    border:2px solid #7cb8ef; box-shadow:0 4px 14px rgba(0,0,0,.5);
+    pointer-events:none; will-change:transform;
+  }
+  .stick.dragging .puck{background:linear-gradient(180deg,#3a86d1,#245e9b)}
+  .dpad{
+    display:grid; grid-template-columns:repeat(3,1fr); grid-template-rows:repeat(3,1fr);
+    gap:6px; width:min(46vw,210px); min-width:150px; height:min(46vw,210px); min-height:150px;
+    touch-action:none; user-select:none; -webkit-user-select:none; flex:0 0 auto;
+  }
+  .dbtn{display:flex; align-items:center; justify-content:center; padding:0; min-height:0}
+  .dbtn svg{width:30px; height:30px; fill:var(--fg); pointer-events:none}
+  .dbtn[data-dir="left"] svg{transform:rotate(-90deg)}
+  .dbtn[data-dir="right"] svg{transform:rotate(90deg)}
+  .dbtn[data-dir="back"] svg{transform:rotate(180deg)}
+  .dbtn.held{background:var(--accent); border-color:#9ccbff}
+  .dbtn.held svg{fill:#04121f}
+  .dcenter{font-size:11px; letter-spacing:.06em; color:var(--muted); font-weight:700}
+  .slider{width:100%; accent-color:var(--accent); height:var(--tap); touch-action:manipulation}
+  .kv{display:flex; justify-content:space-between; gap:10px; padding:3px 0; font-size:13px}
+  .kv span:first-child{color:var(--muted)}
+  .kv span:last-child{font-family:var(--mono)}
+
+  /* ---------- cameras ---------- */
+  .cam{background:var(--panel2); border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:10px}
+  .cam-head{display:flex; align-items:center; gap:8px; padding:6px 8px; border-bottom:1px solid var(--line)}
+  .cam-title{font-weight:700; font-size:12.5px; letter-spacing:.06em}
+  .cam-sub{color:var(--dim); font-size:11px; font-family:var(--mono)}
+  .cam-body{position:relative; background:#000; min-height:120px}
+  .cam-body img{display:block; width:100%; height:auto; max-height:44svh; object-fit:contain; background:#000}
+  /* the two arm cameras are the user's main feedback, so give them a little
+     more presence (and more height) than a generic card */
+  .cam.primary{border-color:#2c4a6b}
+  .cam.primary .cam-title{color:#bcdcff; font-size:13.5px; letter-spacing:.08em}
+  .cam.primary .cam-body img{max-height:52svh}
+  .nosignal{
+    position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background:repeating-linear-gradient(45deg,#141414,#141414 10px,#0f0f0f 10px,#0f0f0f 20px);
+    color:#c9a3a4; font-weight:700; letter-spacing:.1em; font-size:12px; text-align:center; padding:8px;
+    /* column, not the default row: the markup separates the two lines with
+       <br>, which a flex ROW collapses - the fallback used to render as
+       "NO SIGNALtap Reconnect" on one line. */
+    flex-direction:column; gap:2px;
+  }
+  .nosignal.on{display:flex}
+  .mini{min-height:34px; min-width:34px; padding:4px 10px; font-size:12px}
+
+  /* ---------- arm ---------- */
+  /* Two lines per joint: live readout + nudge buttons on the first line, the
+     absolute target box + Go on the second. That keeps every control >=44px
+     and still fits a half-width panel on a desktop, which a 7-column
+     single-line row would not. */
+  .jrow{
+    display:grid; gap:6px 8px; align-items:center; padding:5px 0;
+    grid-template-columns:38px 1fr auto 46px 46px;
+    grid-template-areas:"lab val flag minus plus" "tgt tgt tgt tgt go";
+  }
+  .jrow .jlabel{grid-area:lab; font-weight:700; color:var(--muted); font-size:12.5px}
+  .jrow .jval{grid-area:val; font-family:var(--mono); text-align:right; font-size:13px; color:var(--fg); padding-right:2px}
+  .jrow .jflag{grid-area:flag}
+  .jrow .jminus{grid-area:minus}
+  .jrow .jplus{grid-area:plus}
+  .jrow .jtgt{grid-area:tgt; width:100%; min-width:0; min-height:var(--tap)}
+  .jrow .jgo{grid-area:go}
+  /* A joint the arm refuses to enable is the most confusing state to debug
+     from outside, so mark the row itself rather than hiding it in a log. */
+  .jrow.jrowfault{background:rgba(220,60,60,.13); border-radius:8px}
+  .jrow.jrowoff{opacity:.55}
+  .jflag{font-size:10.5px; font-weight:700; letter-spacing:.04em; padding:1px 6px; border-radius:6px}
+  .jflag.bad{background:rgba(220,60,60,.22); color:#ff9a9a}
+  .jflag.off{background:rgba(255,255,255,.07); color:var(--muted)}
+  .faultline{font-size:12.5px; color:#ff9a9a; margin-top:6px; min-height:0}
+  .faultline:empty{display:none}
+  .jbtn{min-width:52px; min-height:var(--tap); font-size:19px; font-weight:700; line-height:1}
+  .stepsel{min-height:var(--tap); background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:6px 8px}
+  .armbtn{min-height:var(--tap); font-weight:700}
+  .num{
+    background:var(--panel2); border:1px solid var(--line); border-radius:10px;
+    padding:6px 8px; font-family:var(--mono); font-size:13px; min-height:var(--tap);
+  }
+  .num::placeholder{color:var(--dim)}
+
+  /* ---------- two arm panels ---------- */
+  .armpanel{
+    background:var(--panel2); border:1px solid var(--line); border-radius:10px;
+    padding:10px; min-width:0;
+  }
+  /* a faulted joint anywhere in the panel tints the whole panel border, so it
+     reads at a glance without hunting for the red row */
+  .armpanel.armfaulted{border-color:#6d2b2d; box-shadow:inset 0 0 0 1px rgba(220,60,60,.22)}
+  .armpanel > h3{
+    margin:0 0 8px; font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .armpanel > h3 .can{font-family:var(--mono); font-size:10.5px; letter-spacing:0; text-transform:none; color:var(--dim)}
+  .armpanel > h3 .tag{
+    font-size:10.5px; letter-spacing:.04em; text-transform:none; color:var(--dim);
+    border:1px solid var(--line); border-radius:999px; padding:1px 7px; font-weight:400;
+  }
+  .homepose{font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:6px; word-break:break-word}
+  /* Inline confirmation. Deliberately NOT window.confirm(): the rest of this UI
+     avoids native dialogs (they are blocked in some embedded/automated
+     browsers), and an in-page block can be styled, timed out and cancelled. */
+  .confirmrow{
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px;
+    border:1px solid #6b4d09; background:#241a04; color:#ffd489; border-radius:10px;
+    padding:8px 10px; font-size:12.5px;
+  }
+  .confirmrow[hidden]{display:none}
+  .btn-warn{border-color:#6b4d09; color:var(--warn); font-weight:700}
+  .btn-danger{background:#5a1b1d; border-color:var(--bad); color:#ffd2d3; font-weight:700}
+  .btn-danger:active{background:#7a2426}
+
+  /* ---------- arm jog stick (deliberately distinct from the chassis stick) ---------- */
+  .armjog{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+  .ajstick{
+    position:relative; width:min(40vw,170px); height:min(40vw,170px); min-width:140px; min-height:140px;
+    border-radius:50%; background:radial-gradient(circle at 50% 45%,#1a2531,#0d141b 70%);
+    border:2px solid #2c4a6b; touch-action:none; user-select:none; -webkit-user-select:none; flex:0 0 auto;
+  }
+  .ajstick::after{
+    content:""; position:absolute; inset:12%; border-radius:50%;
+    border:1px dashed rgba(143,163,182,.18); pointer-events:none;
+  }
+  .ajpuck{
+    position:absolute; left:50%; top:50%; width:54px; height:54px; margin:-27px 0 0 -27px;
+    border-radius:50%; background:linear-gradient(180deg,#8a5cc4,#5b3a8c);
+    border:2px solid #c3a4f0; box-shadow:0 4px 14px rgba(0,0,0,.5);
+    pointer-events:none; will-change:transform; transition:transform .12s ease;
+  }
+  .ajstick.dragging .ajpuck{background:linear-gradient(180deg,#9d6fd8,#6b45a3)}
+  .ajlab{position:absolute; font-size:10px; font-weight:700; letter-spacing:.06em; color:var(--dim); pointer-events:none}
+  .ajlab.x{left:7px; top:50%; transform:translateY(-50%)}
+  .ajlab.y{left:50%; top:5px; transform:translateX(-50%)}
+  .ajctl{flex:1 1 150px; min-width:140px}
+
+  /* ---------- hand-rolled 3D pose view ---------- */
+  .vizwrap{position:relative; background:#0b1219; border:1px solid var(--line); border-radius:10px; overflow:hidden}
+  .vizwrap canvas{display:block; width:100%; height:170px; touch-action:none; cursor:grab}
+  .vizwrap canvas.dragging{cursor:grabbing}
+  .vizhint{
+    position:absolute; right:6px; bottom:4px; font-size:10px; color:var(--dim); pointer-events:none;
+    font-family:var(--mono);
+  }
+
+  /* ---------- status ---------- */
+  .status-grid{display:grid; grid-template-columns:1fr; gap:2px}
+  .chip{
+    display:inline-flex; align-items:center; gap:6px; border-radius:8px; padding:2px 8px;
+    font-size:11.5px; font-weight:700; border:1px solid var(--line); background:var(--panel2);
+  }
+  .chip.ok{color:var(--ok); border-color:#1d5c3d}
+  .chip.bad{color:#ffd2d3; background:var(--bad-dim); border-color:var(--bad)}
+  .chip.warn{color:var(--warn); border-color:#6b4d09}
+  .chip.mut{color:var(--muted)}
+  .socbar{height:8px; border-radius:6px; background:#1b2530; overflow:hidden; border:1px solid var(--line); flex:1 1 60px}
+  .socbar i{display:block; height:100%; background:var(--ok); width:0%}
+  .socbar.low i{background:var(--warn)} .socbar.crit i{background:var(--bad)}
+  .blink{animation:blink 1.1s steps(2,end) infinite}
+  @keyframes blink{50%{opacity:.35}}
+
+  /* ---------- toast ---------- */
+  #toast{
+    position:fixed; left:50%; transform:translateX(-50%);
+    bottom:calc(14px + env(safe-area-inset-bottom)); z-index:100;
+    max-width:min(92vw,520px); padding:10px 14px; border-radius:10px;
+    background:#1d2a37; border:1px solid var(--line); color:var(--fg);
+    font-size:13px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+    opacity:0; pointer-events:none; transition:opacity .18s ease;
+  }
+  #toast.on{opacity:1}
+  #toast.err{background:var(--bad-dim); border-color:var(--bad); color:#ffd2d3; font-weight:600}
+
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:.001ms !important; animation-iteration-count:1 !important; transition-duration:.001ms !important}
+    .blink{animation:none !important}
+  }
+</style>
+</head>
+<body>
+
+<div class="sticky">
+  <div class="topbar">
+    <div class="brand">AgileX Remote<small>VIRTUAL CONTROLLER</small></div>
+    <span id="connPill" class="pill warn" role="status" aria-live="polite">CONNECTING</span>
+    <span class="grow"></span>
+    <button id="estopClearBtn" class="estop-clear" hidden>CLEAR E-STOP</button>
+    <button id="estopBtn" class="estop" aria-label="Emergency stop: zero velocity and disable both arms">E-STOP</button>
+  </div>
+  <div class="banner">
+    <b>ROBOT IS LIVE.</b>
+    <span id="bannerText">Movements capped at 0.08 m/s and 2&deg; per joint step.</span>
+    <span class="banner-note"><b>Reset</b> re-enables without moving &middot; <b>Home &#9888;</b> MOVES the arm and asks first.</span>
+  </div>
+  <div id="lostBar" class="lostbar" role="alert">
+    <span>CONNECTION LOST &mdash; velocity commands stopped.</span>
+    <button id="retryBtn" class="mini">Retry now</button>
+  </div>
+  <div id="estopBar" class="estopbar" role="alert">
+    <span>E-STOP ACTIVE &mdash; drive and BOTH arms are disabled until cleared.</span>
+  </div>
+</div>
+
+<div class="app">
+
+  <!-- ============ DRIVE ============ -->
+  <section class="card" id="card-drive">
+    <h2>Drive <span class="tag">keyboard &middot; mouse &middot; touch &middot; gamepad</span></h2>
+
+    <div id="driveArea">
+      <div class="stick-wrap">
+        <div id="stick" class="stick" role="application"
+             aria-label="Virtual joystick. Drag up or down to drive, left or right to turn. Springs back to centre on release.">
+          <div id="puck" class="puck"></div>
+        </div>
+        <div class="dpad" id="dpad" role="group" aria-label="Drive pad, hold a button to move">
+          <span></span>
+          <button class="dbtn" data-dir="fwd" aria-label="Drive forward">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8h-4v8h-6v-8H5z"/></svg></button>
+          <span></span>
+          <button class="dbtn" data-dir="left" aria-label="Turn left">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8h-4v8h-6v-8H5z"/></svg></button>
+          <button class="dbtn dcenter" data-dir="zero" aria-label="Zero velocity now">ZERO</button>
+          <button class="dbtn" data-dir="right" aria-label="Turn right">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8h-4v8h-6v-8H5z"/></svg></button>
+          <span></span>
+          <button class="dbtn" data-dir="back" aria-label="Drive backward">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l7 8h-4v8h-6v-8H5z"/></svg></button>
+          <span></span>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <label class="hint" for="speed">Speed limit <b id="speedVal" class="mono">50%</b></label>
+      <input id="speed" class="slider" type="range" min="10" max="100" step="5" value="50"
+             aria-label="Speed limit as a percentage of the robot's maximum">
+      <div class="kv"><span>max linear</span><span id="maxLinVal">0.040 m/s</span></div>
+      <div class="kv"><span>max angular</span><span id="maxAngVal">0.075 rad/s</span></div>
+
+      <div class="sep"></div>
+
+      <div class="kv"><span>commanded</span><span id="velVal">lin 0.000 / ang 0.000</span></div>
+      <div class="kv"><span>link</span><span id="sendVal">idle</span></div>
+      <div class="kv"><span>gamepad</span><span id="gpVal">none</span></div>
+      <div class="hint" id="gpHint">Controller: press any button on it to connect (browsers only expose a gamepad after you use it). Left stick drives, right stick also drives, RT/LT = forward/back.</div>
+      <div class="hint">Keys: <b>W A S D</b> / arrows &middot; <b>Shift</b> = slow &middot; <b>Space</b> or <b>Esc</b> = E-STOP. Releasing a key, a button or the stick always commands zero.</div>
+    </div>
+  </section>
+
+  <!-- ============ CAMERAS ============ -->
+  <section class="card" id="card-cams">
+    <h2>Cameras <span class="tag">live MJPEG &middot; main visual feedback</span></h2>
+
+    <div class="cam primary">
+      <div class="cam-head">
+        <span class="cam-title">LEFT ARM CAMERA</span>
+        <span class="cam-sub">/video?cam=0</span>
+        <span class="grow"></span>
+        <button class="mini" data-reconnect="0">Reconnect</button>
+      </div>
+      <div class="cam-body">
+        <img id="camImg0" alt="Live view from the left arm camera" decoding="async">
+        <div class="nosignal" id="camNs0">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
+      </div>
+    </div>
+
+    <div class="cam primary">
+      <div class="cam-head">
+        <span class="cam-title">RIGHT ARM CAMERA</span>
+        <span class="cam-sub">/video?cam=2</span>
+        <span class="grow"></span>
+        <button class="mini" data-reconnect="2">Reconnect</button>
+      </div>
+      <div class="cam-body">
+        <img id="camImg2" alt="Live view from the right arm camera" decoding="async">
+        <div class="nosignal" id="camNs2">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
+      </div>
+    </div>
+    <div class="hint">Both cameras are mounted on the arms. Android Chrome sometimes drops long-lived MJPEG streams &mdash; use Reconnect.</div>
+  </section>
+
+  <!-- ============ ARMS (both) ============ -->
+  <section class="card" id="card-arms">
+    <h2>Arms <span class="tag">left can_left &middot; right can_right</span></h2>
+
+    <div class="row" style="margin-bottom:10px">
+      <label class="hint" for="stepSel">nudge step (shared by both arms)</label>
+      <select id="stepSel" class="stepsel" aria-label="Joint nudge step in degrees, shared by both arms">
+        <option value="0.5">0.5&deg;</option>
+        <option value="1" selected>1.0&deg;</option>
+        <option value="1.5">1.5&deg;</option>
+        <option value="2">2.0&deg;</option>
+      </select>
+      <span class="hint">server clamps a nudge to <span id="stepCap" class="mono">2.0</span>&deg; &middot; target boxes are absolute and are <b>not</b> clamped to this</span>
+    </div>
+
+    <div class="arms-wrap" id="armsWrap"></div>
+  </section>
+
+  <!-- ============ STATUS ============ -->
+  <section class="card" id="card-status">
+    <h2>Status</h2>
+    <div class="status-grid">
+      <div class="kv"><span>battery</span><span id="rBatt">-- V</span></div>
+      <div class="kv"><span>charge</span><span id="rSoc">-- %</span></div>
+      <div class="row tight" style="padding:2px 0 6px"><span class="socbar" id="socBar"><i id="socFill"></i></span></div>
+      <div class="kv"><span>chassis</span><span id="rChConn">--</span></div>
+      <div class="kv"><span>mode</span><span id="rMode">--</span></div>
+      <div class="kv"><span>chassis error</span><span id="rChErr">--</span></div>
+      <div class="kv"><span>left arm</span><span id="rArmConnL">--</span></div>
+      <div class="kv"><span>left fw</span><span id="rFwL">--</span></div>
+      <div class="kv"><span>left error</span><span id="rArmErrL">--</span></div>
+      <div class="kv"><span>left loop</span><span id="rJitL">--</span></div>
+      <div class="kv"><span>right arm</span><span id="rArmConnR">--</span></div>
+      <div class="kv"><span>right fw</span><span id="rFwR">--</span></div>
+      <div class="kv"><span>right error</span><span id="rArmErrR">--</span></div>
+      <div class="kv"><span>right loop</span><span id="rJitR">--</span></div>
+      <div class="kv"><span>odometry</span><span id="rOdo">--</span></div>
+      <div class="kv"><span>watchdog</span><span id="rWdg">--</span></div>
+      <div class="kv"><span>limits</span><span id="rLimits">--</span></div>
+    </div>
+    <div class="sep"></div>
+    <div class="row tight">
+      <span id="chipEstop" class="chip mut">E-STOP ?</span>
+      <span id="chipChErr" class="chip mut">CH ERR ?</span>
+      <span id="chipArmL" class="chip mut">L ARM ?</span>
+      <span id="chipArmR" class="chip mut">R ARM ?</span>
+      <span id="chipArmErrL" class="chip mut">L ERR ?</span>
+      <span id="chipArmErrR" class="chip mut">R ERR ?</span>
+    </div>
+    <div class="hint" style="margin-top:8px">Readouts refresh 4&times;/second from <span class="mono">/api/status</span>.</div>
+  </section>
+
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =====================================================================
+     0. Helpers
+     ===================================================================== */
+  var el = function (id) { return document.getElementById(id); };
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function r4(v) { return Math.round(v * 10000) / 10000; }
+  /* Cached DOM writers: the rAF loop renders every frame, and writing an
+     unchanged value still mutates the DOM (and costs layout on Android), so
+     every hot-path write goes through these and is skipped when unchanged. */
+  function setText(node, s) { if (node && node.__t !== s) { node.__t = s; node.textContent = s; } }
+  function setHTML(node, s) { if (node && node.__h !== s) { node.__h = s; node.innerHTML = s; } }
+  function setClass(node, c) { if (node && node.__c !== c) { node.__c = c; node.className = c; } }
+  function setStyle(node, prop, v) {
+    if (!node) return;
+    if (!node.__s) node.__s = {};
+    if (node.__s[prop] !== v) { node.__s[prop] = v; node.style[prop] = v; }
+  }
+  /* deadzone with rescale: |v|<d -> 0, else linearly remapped to [0,1] */
+  function deadzone(v, d) {
+    var a = Math.abs(v);
+    if (!isFinite(a)) return 0;
+    if (a < d) return 0;
+    return clamp(Math.sign(v) * (a - d) / (1 - d), -1, 1);
+  }
+  var DEADZONE = 0.12;        /* gamepad axis deadzone (spec: ~0.12) */
+  var STICK_DEADZONE = 0.12;  /* on-screen joystick deadzone */
+  var SLOW_FACTOR = 0.4;      /* keyboard Shift = slower modifier */
+
+  /* =====================================================================
+     1. State
+     ===================================================================== */
+  /* =====================================================================
+     1. State
+     ===================================================================== */
+  /* The robot has TWO Piper arms. Index 0 = LEFT (can_left) and 1 = RIGHT
+     (can_right); the index is exactly the `arm` field the server expects, so
+     it is never converted anywhere else. */
+  var ARM_DEFS = [
+    { idx: 0, key: 'L', side: 'left',  can: 'can_left',  title: 'Left arm'  },
+    { idx: 1, key: 'R', side: 'right', can: 'can_right', title: 'Right arm' }
+  ];
+  function armKey(i) { return ARM_DEFS[i] ? ARM_DEFS[i].key : 'L'; }
+  function armTitle(i) { return ARM_DEFS[i] ? ARM_DEFS[i].title : 'Arm'; }
+  function blankArm() {
+    return {
+      connected: false, enabled: false, firmware: '', errorCode: null,
+      joints: [null, null, null, null, null, null],
+      targets: [null, null, null, null, null, null],
+      jointsEnabled: null, faults: null, gripper: null, home: null, jitter: null
+    };
+  }
+  function fmtPose(a) {
+    if (!Array.isArray(a)) return '--';
+    var out = [], i;
+    for (i = 0; i < 6; i++) out.push((typeof a[i] === 'number') ? a[i].toFixed(1) + '\u00b0' : '--');
+    return out.join(' ');
+  }
+  /* every arm-jog "stop sending" closure, so blur / E-STOP / link loss can end
+     all of them at once. Declared here so it always exists, even if a stop is
+     requested before the panels are built. */
+  var armJogStops = [];
+
+  var state = {
+    connected: false,
+    everConnected: false,
+    statusFails: 0,
+    estopLatch: false,        /* set by the E-STOP button; cleared only by a
+                                 successful /api/estop/clear. The UI stays in the
+                                 stopped state if the E-STOP POST failed - it
+                                 never silently pretends the robot is safe. */
+    serverEstop: false,
+    gesture: false,           /* any real user gesture has happened */
+    speedPct: 50,
+    stepDeg: 1.0,
+    arms: [blankArm(), blankArm()],
+    homeConfirmArm: null,     /* which arm's inline Home confirmation is open */
+    homeConfirmTimer: null,
+    limits: { max_lin: 0.08, max_ang: 0.15, max_joint_step_deg: 2.0 },
+    watchdogMs: 700,
+    gamepadName: '',
+    gamepadIndex: null,
+    lastSent: { lin: 0, ang: 0 },
+    sending: false
+  };
+  function stopped() { return state.estopLatch || state.serverEstop; }
+  function mayDrive() { return state.connected && !stopped(); }
+
+
+  /* =====================================================================
+     2. The single velocity pipeline
+     ---------------------------------------------------------------------
+     Every input method owns one slot. The combiner takes, per axis, the
+     value with the larger absolute magnitude (sign preserved). No summing,
+     so two inputs cannot add up past the speed limit, and a released input
+     sitting at 0 can never cancel a held one.
+     ===================================================================== */
+  var sources = {
+    key:     { lin: 0, ang: 0 },
+    dpad:    { lin: 0, ang: 0 },
+    stick:   { lin: 0, ang: 0 },
+    gamepad: { lin: 0, ang: 0 }
+  };
+  function setSource(name, lin, ang) {
+    var s = sources[name];
+    s.lin = clamp(lin, -1, 1);
+    s.ang = clamp(ang, -1, 1);
+  }
+  function combine() {
+    var lin = 0, ang = 0, k, s;
+    for (k in sources) {
+      if (!Object.prototype.hasOwnProperty.call(sources, k)) continue;
+      s = sources[k];
+      if (Math.abs(s.lin) > Math.abs(lin)) lin = s.lin;
+      if (Math.abs(s.ang) > Math.abs(ang)) ang = s.ang;
+    }
+    return { lin: lin, ang: ang };
+  }
+  function targetVelocity() {
+    var c = combine();
+    var f = state.speedPct / 100;
+    return {
+      lin: r4(c.lin * state.limits.max_lin * f),
+      ang: r4(c.ang * state.limits.max_ang * f)
+    };
+  }
+  function zeroAllSources() {
+    var k;
+    for (k in sources) {
+      if (Object.prototype.hasOwnProperty.call(sources, k)) { sources[k].lin = 0; sources[k].ang = 0; }
+    }
+    keysClear();
+    dpadHeldClear();
+    stickRelease(false);
+    stopAllHolds();
+    stopArmJogs();          /* the arm jog stick must also stop streaming nudges */
+    renderDriveState();
+  }
+
+  /* =====================================================================
+     3. API layer - every call is wrapped, times out, and can never throw
+     ===================================================================== */
+  function api(method, url, body, timeoutMs) {
+    var ctl = null, timer = null;
+    try { ctl = new AbortController(); } catch (e) { ctl = null; }
+    var opts = { method: method, cache: 'no-store' };
+    if (body !== null && body !== undefined) {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+    if (ctl) { opts.signal = ctl.signal; timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, timeoutMs || 2000); }
+    return fetch(url, opts).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).catch(function () {
+      return null;               /* never rejects: callers always get null on failure */
+    }).then(function (v) {
+      if (timer) clearTimeout(timer);
+      return v;
+    });
+  }
+
+  var driveInFlight = false, driveFails = 0;
+  function postDrive(lin, ang, countFailure) {
+    if (driveInFlight) return;                 /* never pile requests up on a slow link */
+    driveInFlight = true;
+    state.lastSent = { lin: lin, ang: ang };
+    state.sending = true;
+    api('POST', '/api/drive', { lin: lin, ang: ang }, 900).then(function (r) {
+      driveInFlight = false;
+      state.sending = false;
+      if (r) {
+        driveFails = 0;
+      } else if (countFailure) {
+        driveFails++;
+        if (driveFails >= 4) setConnected(false);   /* link is unusable: stop commanding */
+      }
+      renderDriveState();
+    });
+  }
+
+  /* =====================================================================
+     4. Toast (never alert())
+     ===================================================================== */
+  var toastEl = el('toast'), toastTimer = null;
+  function toast(msg, isErr) {
+    toastEl.textContent = msg;
+    toastEl.className = 'on' + (isErr ? ' err' : '');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.className = ''; }, isErr ? 4200 : 2400);
+  }
+
+  /* =====================================================================
+     5. Connection state
+     ===================================================================== */
+  function setConnected(up) {
+    if (state.connected === up) { if (!up) renderConnection(); return; }
+    if (!up) sendZeroBestEffort();          /* get a zero out while we still think the link is up */
+    state.connected = up;
+    if (up) { state.everConnected = true; state.statusFails = 0; }
+    if (!up) {
+      /* A lost link must stop every command path immediately. */
+      zeroAllSources();
+      driveFails = 0;
+    }
+    renderConnection();
+  }
+  function renderConnection() {
+    var pill = el('connPill');
+    if (state.connected) { setClass(pill, 'pill ok'); setText(pill, 'ONLINE'); }
+    else if (!state.everConnected) { setClass(pill, 'pill warn'); setText(pill, 'CONNECTING'); }
+    else { setClass(pill, 'pill bad blink'); setText(pill, 'CONNECTION LOST'); }
+    setClass(el('lostBar'), 'lostbar' + ((!state.connected && state.everConnected) ? ' on' : ''));
+    setClass(el('driveArea'), mayDrive() ? '' : 'drive-disabled');
+    /* keep the control enabled/disabled state in step with the link: on a lost
+       link this is what visibly greys out BOTH arm panels */
+    renderEstop();
+  }
+
+  /* =====================================================================
+     6. Status polling (4 Hz)
+     ===================================================================== */
+  var statusInFlight = false, statusTimer = null, statusPromise = null;
+  function pollStatus() {
+    if (statusInFlight) return statusPromise || Promise.resolve(null);
+    statusInFlight = true;
+    statusPromise = api('GET', '/api/status', null, 1800).then(function (s) {
+      statusInFlight = false;
+      if (!s) {
+        state.statusFails++;
+        if (state.statusFails >= 3) setConnected(false);
+        renderConnection();
+        return null;
+      }
+      state.statusFails = 0;
+      setConnected(true);
+      applyStatus(s);
+      return s;
+    });
+    return statusPromise;
+  }
+  function applyStatus(s) {
+    if (s.limits) {
+      if (typeof s.limits.max_lin === 'number' && s.limits.max_lin > 0) state.limits.max_lin = s.limits.max_lin;
+      if (typeof s.limits.max_ang === 'number' && s.limits.max_ang > 0) state.limits.max_ang = s.limits.max_ang;
+      if (typeof s.limits.max_joint_step_deg === 'number' && s.limits.max_joint_step_deg > 0) {
+        state.limits.max_joint_step_deg = s.limits.max_joint_step_deg;
+      }
+    }
+    if (typeof s.watchdog_ms === 'number' && s.watchdog_ms > 0) state.watchdogMs = s.watchdog_ms;
+    state.serverEstop = !!s.estop;
+
+    var ch = s.chassis || {};
+    setText(el('rBatt'), (typeof ch.battery_v === 'number' ? ch.battery_v.toFixed(1) : '--') + ' V');
+    var soc = (typeof ch.soc_pct === 'number') ? clamp(ch.soc_pct, 0, 100) : null;
+    setText(el('rSoc'), (soc === null ? '--' : soc.toFixed(0)) + ' %');
+    setClass(el('socBar'), 'socbar' + (soc === null ? '' : (soc < 15 ? ' crit' : (soc < 35 ? ' low' : ''))));
+    setStyle(el('socFill'), 'width', (soc === null ? 0 : soc) + '%');
+    setHTML(el('rChConn'), connChip(ch.connected));
+    setText(el('rMode'), ch.mode || '--');
+    setHTML(el('rChErr'), errChip(ch.error_code));
+    var ox = (typeof ch.odom_x === 'number') ? ch.odom_x.toFixed(2) : '--';
+    var oy = (typeof ch.odom_y === 'number') ? ch.odom_y.toFixed(2) : '--';
+    setText(el('rOdo'), ox + ', ' + oy + ' m');
+    setText(el('rWdg'), state.watchdogMs + ' ms');
+    setText(el('rLimits'), state.limits.max_lin + ' m/s, ' + state.limits.max_ang + ' rad/s, ' + state.limits.max_joint_step_deg + '\u00b0');
+
+    /* BOTH arms. `arms` is the new array [left, right]; if a server predates it
+       we fall back to the legacy single `arm` object for the left arm, so this
+       page keeps working against either server version. */
+    var armsArr = Array.isArray(s.arms) ? s.arms : null;
+    for (var i = 0; i < ARM_DEFS.length; i++) {
+      var raw = (armsArr && armsArr[i]) ? armsArr[i] : (i === 0 ? s.arm : null);
+      applyArmStatus(i, raw || {});
+    }
+
+    setClass(el('chipEstop'), 'chip ' + (s.estop ? 'bad' : 'ok'));
+    setText(el('chipEstop'), s.estop ? 'E-STOP ACTIVE' : 'E-STOP clear');
+    setClass(el('chipChErr'), 'chip ' + (num(ch.error_code) ? 'bad blink' : 'ok'));
+    setText(el('chipChErr'), 'CH ERR ' + (num(ch.error_code) ? ch.error_code : '0'));
+
+    setText(el('bannerText'), 'Movements capped at ' + state.limits.max_lin + ' m/s and '
+      + state.limits.max_joint_step_deg + '\u00b0 per joint step.');
+    renderEstop();
+    renderConnection();
+    renderDriveState();
+    renderStepCap();
+  }
+  function applyArmStatus(i, ar) {
+    var a = state.arms[i], k = armKey(i);
+    a.connected = !!ar.connected;
+    a.enabled = !!ar.enabled;
+    a.firmware = ar.firmware || '';
+    a.errorCode = (typeof ar.error_code === 'number') ? ar.error_code : null;
+    if (Array.isArray(ar.joints_deg)) a.joints = ar.joints_deg.slice(0, 6);
+    if (Array.isArray(ar.targets_deg)) a.targets = ar.targets_deg.slice(0, 6);
+    a.jointsEnabled = Array.isArray(ar.joints_enabled) ? ar.joints_enabled.slice(0, 6) : null;
+    a.faults = Array.isArray(ar.faults) ? ar.faults.slice(0, 6) : null;
+    if (typeof ar.gripper_deg === 'number') a.gripper = ar.gripper_deg;
+    a.home = Array.isArray(ar.home_deg) ? ar.home_deg.slice(0, 6) : null;
+    a.jitter = ar.jitter || null;
+
+    setHTML(el('rArmConn' + k), connChip(a.connected));
+    setHTML(el('rArmErr' + k), errChip(ar.error_code));
+    setText(el('rFw' + k), a.firmware || '--');
+    var jt = a.jitter;
+    setText(el('rJit' + k), (jt && typeof jt.cmd_hz === 'number' && typeof jt.feedback_hz === 'number')
+      ? 'cmd ' + jt.cmd_hz.toFixed(0) + ' / fb ' + jt.feedback_hz.toFixed(0) + ' Hz' : '--');
+
+    var n = a.jointsEnabled ? a.jointsEnabled.filter(Boolean).length : null;
+    var nf = 0, q;
+    if (a.faults) for (q = 0; q < 6; q++) if (a.faults[q] && a.faults[q].length) nf++;
+    var chip = el('chipArm' + k);
+    if (chip) {
+      var bad = (nf > 0) || (n !== null && n < 6) || !a.connected;
+      setClass(chip, 'chip ' + (bad ? (nf > 0 ? 'bad blink' : 'warn') : 'ok'));
+      setText(chip, k + ' ARM ' + (a.connected
+        ? ((n === null ? '?' : n) + '/6' + (nf ? ' ' + nf + ' FLT' : ''))
+        : 'DOWN'));
+    }
+    var ce = el('chipArmErr' + k);
+    if (ce) {
+      setClass(ce, 'chip ' + (num(a.errorCode) ? 'bad blink' : 'ok'));
+      setText(ce, k + ' ERR ' + (num(a.errorCode) ? a.errorCode : '0'));
+    }
+
+    renderJoints(i);
+    renderGripper(i);
+    renderArmPanel(i);
+    markVizDirty(i);
+  }
+
+  function num(v) { return typeof v === 'number' && v !== 0; }
+  function connChip(ok) {
+    return ok ? '<span class="chip ok">connected</span>' : '<span class="chip bad">DISCONNECTED</span>';
+  }
+  function errChip(code) {
+    if (typeof code !== 'number') return '<span class="chip mut">--</span>';
+    return code === 0 ? '<span class="chip ok">0</span>' : '<span class="chip bad blink">ERR ' + code + '</span>';
+  }
+
+  /* =====================================================================
+     7. Keyboard  (WASD + arrows, Shift = slow, Space/Esc = E-STOP)
+     ===================================================================== */
+  var keys = new Set();
+  var DRIVE_KEYS = { w: 1, a: 1, s: 1, d: 1, arrowup: 1, arrowdown: 1, arrowleft: 1, arrowright: 1 };
+  function keysClear() { if (keys.size) { keys.clear(); setSource('key', 0, 0); } }
+  function updateKeySource() {
+    var lin = 0, ang = 0;
+    if (keys.has('w') || keys.has('arrowup')) lin += 1;
+    if (keys.has('s') || keys.has('arrowdown')) lin -= 1;
+    if (keys.has('a') || keys.has('arrowleft')) ang += 1;    /* +ang = turn left */
+    if (keys.has('d') || keys.has('arrowright')) ang -= 1;
+    var m = keys.has('shift') ? SLOW_FACTOR : 1;
+    setSource('key', lin * m, ang * m);
+  }
+  function isTypingTarget(t) {
+    if (!t || !t.tagName) return false;
+    var tag = t.tagName.toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || t.isContentEditable === true;
+  }
+  function markGesture() { state.gesture = true; }
+  window.addEventListener('keydown', function (e) {
+    if (isTypingTarget(e.target)) return;               /* never steal keys from a field */
+    var k = (e.key || '').toLowerCase();
+    if (k === ' ' || k === 'spacebar' || k === 'escape' || k === 'esc') {
+      e.preventDefault();
+      if (!e.repeat) triggerEstop('keyboard');
+      return;
+    }
+    if (DRIVE_KEYS[k] || k === 'shift') {
+      if (DRIVE_KEYS[k]) e.preventDefault();            /* stop arrow-key page scroll */
+      markGesture();
+      keys.add(k);
+      updateKeySource();
+      renderDriveState();
+    }
+  }, { passive: false });
+  window.addEventListener('keyup', function (e) {
+    var k = (e.key || '').toLowerCase();
+    if (keys.has(k)) { keys.delete(k); updateKeySource(); renderDriveState(); }
+  });
+  /* alt-tab / focus loss MUST NOT leave the robot driving */
+  window.addEventListener('blur', function () { hardStop('window blur'); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) hardStop('tab hidden');
+  });
+  function hardStop(why) {
+    zeroAllSources();
+    sendZeroBestEffort();
+    if (why) renderDriveState();
+  }
+
+  /* =====================================================================
+     8. Mouse / touch D-pad (hold to drive, pointer capture so a drag off the
+        button still releases correctly)
+     ===================================================================== */
+  var dpadHeld = new Set();
+  function dpadHeldClear() { if (dpadHeld.size) { dpadHeld.clear(); setSource('dpad', 0, 0); renderDpad(); } }
+  function updateDpadSource() {
+    var lin = 0, ang = 0;
+    if (dpadHeld.has('fwd')) lin += 1;
+    if (dpadHeld.has('back')) lin -= 1;
+    if (dpadHeld.has('left')) ang += 1;
+    if (dpadHeld.has('right')) ang -= 1;
+    setSource('dpad', lin, ang);
+    renderDpad();
+  }
+  function renderDpad() {
+    var btns = document.querySelectorAll('.dbtn');
+    for (var i = 0; i < btns.length; i++) {
+      var d = btns[i].getAttribute('data-dir');
+      if (dpadHeld.has(d)) btns[i].classList.add('held'); else btns[i].classList.remove('held');
+    }
+  }
+  (function initDpad() {
+    var btns = document.querySelectorAll('.dbtn');
+    for (var i = 0; i < btns.length; i++) {
+      (function (btn) {
+        var dir = btn.getAttribute('data-dir'), pid = null;
+        btn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+        btn.addEventListener('pointerdown', function (e) {
+          if (pid !== null) return;
+          e.preventDefault();
+          markGesture();
+          pid = e.pointerId;
+          try { btn.setPointerCapture(pid); } catch (err) {}
+          if (dir === 'zero') { zeroAllSources(); sendZeroBestEffort(); toast('Zero commanded'); return; }
+          dpadHeld.add(dir);
+          updateDpadSource();
+        });
+        function end(e) {
+          if (pid === null) return;
+          if (e && e.pointerId !== undefined && e.pointerId !== pid) return;
+          try { btn.releasePointerCapture(pid); } catch (err) {}
+          pid = null;
+          if (dpadHeld.delete(dir)) updateDpadSource();
+        }
+        btn.addEventListener('pointerup', end);
+        btn.addEventListener('pointercancel', end);
+        btn.addEventListener('lostpointercapture', end);
+      })(btns[i]);
+    }
+  })();
+
+  /* =====================================================================
+     9. On-screen virtual joystick (Pointer Events + setPointerCapture)
+     ===================================================================== */
+  var stickEl = el('stick'), puckEl = el('puck');
+  var stickPid = null;
+  function stickRelease(sendZero) {
+    if (stickPid === null) { setSource('stick', 0, 0); return; }
+    try { stickEl.releasePointerCapture(stickPid); } catch (e) {}
+    stickPid = null;
+    setSource('stick', 0, 0);
+    puckEl.style.transform = 'translate3d(0px,0px,0)';
+    stickEl.classList.remove('dragging');
+    if (sendZero) renderDriveState();
+  }
+  function stickMove(e) {
+    var r = stickEl.getBoundingClientRect();
+    var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    var maxR = Math.max(20, Math.min(r.width, r.height) / 2 - 33);   /* 33 = puck radius */
+    var dx = e.clientX - cx, dy = e.clientY - cy;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > maxR) { dx = dx / dist * maxR; dy = dy / dist * maxR; }
+    var nx = deadzone(dx / maxR, STICK_DEADZONE);
+    var ny = deadzone(dy / maxR, STICK_DEADZONE);
+    /* screen up (negative dy) = forward (+lin); stick left = +ang (turn left) */
+    setSource('stick', -ny, -nx);
+    puckEl.style.transform = 'translate3d(' + dx.toFixed(1) + 'px,' + dy.toFixed(1) + 'px,0)';
+    renderDriveState();
+  }
+  stickEl.addEventListener('pointerdown', function (e) {
+    if (stickPid !== null) return;                 /* one finger drives the stick */
+    e.preventDefault();
+    markGesture();
+    stickPid = e.pointerId;
+    try { stickEl.setPointerCapture(e.pointerId); } catch (err) {}
+    stickEl.classList.add('dragging');
+    stickMove(e);
+  });
+  stickEl.addEventListener('pointermove', function (e) { if (e.pointerId === stickPid) stickMove(e); });
+  stickEl.addEventListener('pointerup', function (e) { if (e.pointerId === stickPid) { stickRelease(true); } });
+  stickEl.addEventListener('pointercancel', function (e) { if (e.pointerId === stickPid) { stickRelease(true); } });
+  stickEl.addEventListener('lostpointercapture', function (e) { if (e.pointerId === stickPid) { stickRelease(true); } });
+  stickEl.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  /* =====================================================================
+     10. Physical gamepad (Gamepad API, polled in the rAF loop)
+     ===================================================================== */
+  function padAxes(pad) {
+    var ax = pad.axes || [];
+    var lx = deadzone(ax[0] || 0, DEADZONE), ly = deadzone(ax[1] || 0, DEADZONE);
+    var rx = deadzone(ax[2] || 0, DEADZONE), ry = deadzone(ax[3] || 0, DEADZONE);
+    var lin = -ly, ang = -lx;                                  /* left stick */
+    if (Math.abs(-ry) > Math.abs(lin)) lin = -ry;              /* right stick also drives */
+    if (Math.abs(-rx) > Math.abs(ang)) ang = -rx;
+    var b = pad.buttons || [];
+    var rt = b[7] ? clamp(b[7].value || 0, 0, 1) : 0;          /* triggers: optional */
+    var lt = b[6] ? clamp(b[6].value || 0, 0, 1) : 0;
+    var tl = deadzone(rt, DEADZONE) - deadzone(lt, DEADZONE);
+    if (Math.abs(tl) > Math.abs(lin)) lin = tl;
+    return { lin: clamp(lin, -1, 1), ang: clamp(ang, -1, 1) };
+  }
+  function pollGamepad() {
+    if (!navigator.getGamepads) return;
+    var pads = navigator.getGamepads(), pad = null, i;
+    if (state.gamepadIndex !== null && pads[state.gamepadIndex]) pad = pads[state.gamepadIndex];
+    if (!pad) {
+      for (i = 0; i < pads.length; i++) { if (pads[i] && pads[i].connected) { pad = pads[i]; break; } }
+    }
+    if (!pad) {
+      if (state.gamepadIndex !== null || sources.gamepad.lin || sources.gamepad.ang) {
+        state.gamepadIndex = null; state.gamepadName = '';
+        setSource('gamepad', 0, 0);            /* disconnect -> zero immediately */
+        renderGamepad(); renderDriveState();
+      }
+      return;
+    }
+    var changed = (state.gamepadIndex !== pad.index) || (state.gamepadName !== (pad.id || ''));
+    state.gamepadIndex = pad.index;
+    state.gamepadName = pad.id || 'gamepad';
+    var v = state.gesture ? padAxes(pad) : { lin: 0, ang: 0 };
+    setSource('gamepad', v.lin, v.ang);
+    if (changed) { renderGamepad(); toast('Gamepad connected: ' + shortPad(state.gamepadName)); }
+  }
+  function shortPad(id) { return String(id || '').replace(/\s*\(.*?\)\s*/g, ' ').trim().slice(0, 44); }
+  function renderGamepad() {
+    var t = state.gamepadIndex === null ? 'none - press a button on it' : shortPad(state.gamepadName);
+    el('gpVal').textContent = t;
+  }
+  window.addEventListener('gamepadconnected', function (e) {
+    markGesture();                                  /* using a pad is a user gesture */
+    state.gamepadIndex = e.gamepad.index;
+    state.gamepadName = e.gamepad.id || 'gamepad';
+    renderGamepad();
+    toast('Gamepad connected: ' + shortPad(state.gamepadName));
+  });
+  window.addEventListener('gamepaddisconnected', function (e) {
+    if (state.gamepadIndex === e.gamepad.index) { state.gamepadIndex = null; state.gamepadName = ''; }
+    setSource('gamepad', 0, 0);                     /* disconnect -> zero immediately */
+    renderGamepad(); renderDriveState();
+    toast('Gamepad disconnected - velocity zeroed', true);
+  });
+
+  /* =====================================================================
+     11. Drive sender + 60 Hz loop
+     ---------------------------------------------------------------------
+     ONE rAF loop: polls the gamepad, recomputes the combined velocity, and
+     sends at ~10 Hz while anything is held. On release it sends a short tail
+     of zeros (8 x 100 ms = 800 ms, comfortably past the server's 700 ms
+     watchdog). Nothing is ever sent while stopped or disconnected.
+     ===================================================================== */
+  var ZERO_TAIL = 8;
+  var zeroTail = 0, lastSendTs = -1e9, wasActive = false;
+  function loop(ts) {
+    try {
+      pollGamepad();
+      var t = targetVelocity();
+      var active = (t.lin !== 0 || t.ang !== 0);
+      if (!mayDrive()) {
+        zeroTail = 0; wasActive = false;
+        if (ts - lastSendTs > 500) { lastSendTs = ts; if (stopped()) postDrive(0, 0, false); }
+      } else if (active) {
+        zeroTail = ZERO_TAIL;
+        if (!wasActive || ts - lastSendTs >= 100) { lastSendTs = ts; postDrive(t.lin, t.ang, true); }
+        wasActive = true;
+      } else {
+        wasActive = false;
+        if (zeroTail > 0 && ts - lastSendTs >= 100) { lastSendTs = ts; zeroTail--; postDrive(0, 0, false); }
+      }
+      renderDriveState();
+    } catch (e) { /* the loop must never die */ }
+    requestAnimationFrame(loop);
+  }
+  function sendZeroBestEffort() {
+    try {
+      if (!state.connected) return;
+      api('POST', '/api/drive', { lin: 0, ang: 0 }, 1200);
+    } catch (e) {}
+  }
+  /* Last-resort safety net on unload. The server watchdog is the real
+     guarantee; this just tries to get a zero out a few hundred ms earlier. */
+  window.addEventListener('pagehide', function () {
+    try {
+      var body = JSON.stringify({ lin: 0, ang: 0 });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon('/api/drive', new Blob([body], { type: 'application/json' }));
+      } else {
+        fetch('/api/drive', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body, keepalive: true });
+      }
+    } catch (e) {}
+  });
+
+  function renderDriveState() {
+    var t = targetVelocity();
+    var src = combine();
+    var parts = [];
+    if (src.lin || src.ang) {
+      if (sources.key.lin || sources.key.ang) parts.push('kbd');
+      if (sources.dpad.lin || sources.dpad.ang) parts.push('pad');
+      if (sources.stick.lin || sources.stick.ang) parts.push('stick');
+      if (sources.gamepad.lin || sources.gamepad.ang) parts.push('gamepad');
+    }
+    setText(el('velVal'), 'lin ' + t.lin.toFixed(3) + ' / ang ' + t.ang.toFixed(3));
+    var link = 'idle';
+    if (stopped()) link = 'stopped (E-STOP)';
+    else if (!state.connected) link = 'no link';
+    else if (t.lin !== 0 || t.ang !== 0) link = 'sending 10 Hz' + (parts.length ? ' [' + parts.join('+') + ']' : '');
+    else if (state.sending) link = 'sending zero';
+    setText(el('sendVal'), link);
+    setText(el('speedVal'), state.speedPct + '%');
+    setText(el('maxLinVal'), r4(state.limits.max_lin * state.speedPct / 100).toFixed(3) + ' m/s');
+    setText(el('maxAngVal'), r4(state.limits.max_ang * state.speedPct / 100).toFixed(3) + ' rad/s');
+  }
+
+  /* =====================================================================
+     12. E-STOP
+     ===================================================================== */
+  function triggerEstop(origin) {
+    state.estopLatch = true;
+    zeroAllSources();
+    renderEstop();
+    renderConnection();
+    renderDriveState();
+    api('POST', '/api/estop', null, 2500).then(function (r) {
+      if (r && r.estop === true) {
+        state.serverEstop = true;
+        toast('E-STOP engaged' + (origin ? ' (' + origin + ')' : ''));
+      } else {
+        state.serverEstop = true;   /* stay latched regardless - fail safe */
+        toast('E-STOP sent, but the server did not confirm it', true);
+      }
+      renderEstop();
+    });
+  }
+  function clearEstop() {
+    api('POST', '/api/estop/clear', null, 2500).then(function (r) {
+      if (r && r.estop === false) {
+        state.estopLatch = false;
+        state.serverEstop = false;
+        renderEstop(); renderConnection(); renderDriveState();
+        toast('E-STOP cleared');
+      } else {
+        toast('Could not clear E-STOP (server did not confirm)', true);
+      }
+    });
+  }
+  var estopRenderKey = null;
+  function renderEstop() {
+    var on = stopped();
+    var dis = on || !state.connected;
+    /* Home MOVES the arm, so it must never be fireable while stopped or
+       offline: drop any pending confirmation the moment that becomes true. */
+    if (dis && state.homeConfirmArm !== null) closeHomeConfirm();
+    var key = (on ? 1 : 0) + '|' + (dis ? 1 : 0);
+    if (key === estopRenderKey) return;              /* called 4x/s: skip no-ops */
+    estopRenderKey = key;
+    setClass(el('estopBar'), 'estopbar' + (on ? ' on' : ''));
+    el('estopClearBtn').hidden = !on;
+    el('estopBtn').disabled = on;
+    setText(el('estopBtn'), on ? 'E-STOPPED' : 'E-STOP');
+    /* E-STOP disables BOTH arms, so gate both panels. */
+    for (var a = 0; a < ARM_DEFS.length; a++) {
+      var k = armKey(a);
+      var eb = el('armEnableBtn' + k); if (eb) eb.disabled = dis;
+      var rb = el('armResetBtn' + k);  if (rb) rb.disabled = dis;
+      var hb = el('armHomeBtn' + k);   if (hb) hb.disabled = dis;
+      var go = el('gripOpen' + k);     if (go) go.disabled = dis;
+      var gc = el('gripClose' + k);    if (gc) gc.disabled = dis;
+      var ag = el('armAllGo' + k);     if (ag) ag.disabled = dis;
+      renderArmPanel(a);
+    }
+    var jb = document.querySelectorAll('.jbtn');
+    for (var i = 0; i < jb.length; i++) jb[i].disabled = dis;
+    var gb = document.querySelectorAll('.jgo');
+    for (var q = 0; q < gb.length; q++) gb[q].disabled = dis;
+  }
+
+  /* =====================================================================
+     13. Arms - TWO panels (left = can_left, right = can_right)
+     ---------------------------------------------------------------------
+     Every arm command carries an explicit `arm` field (0 = left, 1 = right).
+     The server treats a missing field as the left arm, but we always send it
+     so the two panels can never be confused with one another.
+     ===================================================================== */
+  function armPanelHTML(a) {
+    var k = a.key, i, rows = '';
+    for (i = 0; i < 6; i++) {
+      rows += '<div class="jrow" id="jr' + k + i + '">'
+        + '<span class="jlabel">J' + (i + 1) + '</span>'
+        + '<span class="jval" id="jv' + k + i + '">--</span>'
+        + '<span class="jflag" id="jf' + k + i + '"></span>'
+        + '<button class="jbtn jminus" data-arm="' + a.idx + '" data-joint="' + i + '" data-dir="-1" aria-label="' + a.title + ' joint ' + (i + 1) + ' decrease">&minus;</button>'
+        + '<button class="jbtn jplus" data-arm="' + a.idx + '" data-joint="' + i + '" data-dir="1" aria-label="' + a.title + ' joint ' + (i + 1) + ' increase">+</button>'
+        + '<input class="num jtgt" id="jt' + k + i + '" type="number" step="0.1" inputmode="decimal" enterkeyhint="go"'
+        + ' placeholder="target \u00b0" aria-label="Absolute target angle in degrees for ' + a.title + ' joint ' + (i + 1) + '">'
+        + '<button class="jgo armbtn" id="jg' + k + i + '" data-arm="' + a.idx + '" data-joint="' + i + '" aria-label="Send the typed target for ' + a.title + ' joint ' + (i + 1) + '">Go</button>'
+        + '</div>';
+    }
+    return ''
+      + '<div class="armpanel" id="panel' + k + '">'
+      +   '<h3><span>' + a.title + '</span><span class="can">' + a.can + '</span>'
+      +     '<span class="grow"></span><span class="tag" id="armState' + k + '">unknown</span></h3>'
+      +   '<div class="row" style="margin-bottom:8px">'
+      +     '<button class="armbtn" id="armEnableBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 96px">Enable arm</button>'
+      +     '<button class="armbtn btn-warn" id="armResetBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 70px"'
+      +       ' aria-label="Reset the ' + a.title + ': clear the latched motion fault and re-enable. This does not move the arm.">Reset</button>'
+      +     '<button class="armbtn btn-danger" id="armHomeBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 84px"'
+      +       ' aria-label="Home the ' + a.title + ': MOVE it back to its home pose. Asks for confirmation first.">Home &#9888;</button>'
+      +   '</div>'
+      +   '<div class="vizwrap">'
+      +     '<canvas id="viz' + k + '" width="300" height="170" role="img"'
+      +       ' aria-label="3D view of the ' + a.title + ' pose: solid line is measured, dashed amber is the commanded target"></canvas>'
+      +     '<span class="vizhint">drag to orbit</span>'
+      +   '</div>'
+      +   '<div id="armRows' + k + '" style="margin-top:8px">' + rows + '</div>'
+      +   '<div class="faultline" id="armFault' + k + '" role="status"></div>'
+      +   '<div class="homepose" id="armHome' + k + '">home pose: --</div>'
+      +   '<div class="confirmrow" id="armHomeConfirm' + k + '" hidden>'
+      +     '<span id="armHomeConfirmText' + k + '">Move this arm home? THE ARM WILL MOVE.</span>'
+      +     '<span class="grow"></span>'
+      +     '<button class="mini" id="armHomeCancel' + k + '">Cancel</button>'
+      +     '<button class="mini btn-danger" id="armHomeGo' + k + '">Yes, move it</button>'
+      +   '</div>'
+      +   '<div class="sep"></div>'
+      +   '<div class="row">'
+      +     '<span class="hint">gripper</span>'
+      +     '<span class="mono" id="gripVal' + k + '" style="min-width:64px; text-align:right">--</span>'
+      +     '<span class="grow"></span>'
+      +     '<button class="armbtn" id="gripOpen' + k + '" data-arm="' + a.idx + '" style="min-width:74px">Open +</button>'
+      +     '<button class="armbtn" id="gripClose' + k + '" data-arm="' + a.idx + '" style="min-width:74px">Close &minus;</button>'
+      +   '</div>'
+      +   '<div class="sep"></div>'
+      +   '<div class="hint"><b>Arm jog</b> &mdash; horizontal = <b>J1</b> (base yaw), vertical = the joint picked on the right. '
+      +     'Streams small nudges while held and stops the instant you let go.</div>'
+      +   '<div class="armjog" style="margin-top:8px">'
+      +     '<div class="ajstick" id="ajStick' + k + '" role="application"'
+      +       ' aria-label="' + a.title + ' jog stick. Left and right drive joint 1; up and down drive the joint selected beside it. Springs back to centre on release.">'
+      +       '<div class="ajpuck" id="ajPuck' + k + '"></div>'
+      +       '<span class="ajlab y" id="ajYLab' + k + '">J2</span>'
+      +       '<span class="ajlab x">J1</span>'
+      +     '</div>'
+      +     '<div class="ajctl">'
+      +       '<label class="hint" for="ajYSel' + k + '">vertical axis drives</label>'
+      +       '<select class="stepsel" id="ajYSel' + k + '" style="width:100%" aria-label="Which joint the ' + a.title + ' jog stick vertical axis drives">'
+      +         '<option value="1" selected>J2 &mdash; shoulder</option>'
+      +         '<option value="2">J3 &mdash; elbow</option>'
+      +         '<option value="3">J2 + J3 (same direction)</option>'
+      +       '</select>'
+      +       '<div class="kv"><span>jog</span><span id="ajVal' + k + '">idle</span></div>'
+      +       '<div class="kv"><span>targets</span><span id="ajTgt' + k + '">--</span></div>'
+      +     '</div>'
+      +   '</div>'
+      +   '<div class="row" style="margin-top:8px">'
+      +     '<button class="armbtn" id="armAllGo' + k + '" data-arm="' + a.idx + '" style="flex:1 1 100%">Go: send all 6 targets at once</button>'
+      +   '</div>'
+      +   '<div class="hint" style="margin-top:8px">Nudge step comes from the shared <b>step</b> selector above. '
+      +     'Hold &minus;/+ to jog. A target box is <b>absolute</b> and is not clamped to the step &mdash; the server clamps it to the joint limits. '
+      +     'Gripper: + = open, &minus; = close.</div>'
+      + '</div>';
+  }
+  (function buildArmPanels() {
+    var host = el('armsWrap'), html = '';
+    for (var i = 0; i < ARM_DEFS.length; i++) html += armPanelHTML(ARM_DEFS[i]);
+    host.innerHTML = html;
+  })();
+  function renderJoints(i) {
+    var a = state.arms[i], k = armKey(i);
+    var en = a.jointsEnabled, fl = a.faults;
+    for (var j = 0; j < 6; j++) {
+      var v = a.joints[j];
+      var row = el('jr' + k + j);
+      var bad = !!(fl && fl[j] && fl[j].length);
+      var off = !!(en && en[j] === false);
+      setText(el('jv' + k + j), (typeof v === 'number') ? v.toFixed(1) + '\u00b0' : '--');
+      var fEl = el('jf' + k + j);
+      if (fEl) {
+        fEl.textContent = bad ? 'FAULT' : (off ? 'off' : '');
+        fEl.className = 'jflag' + (bad ? ' bad' : (off ? ' off' : ''));
+      }
+      if (row) {
+        // A joint the arm refuses to enable is the single most confusing state
+        // to debug from the outside, so say so on the row itself.
+        row.classList.toggle('jrowfault', bad);
+        row.classList.toggle('jrowoff', off && !bad);
+        row.title = bad ? ('J' + (j + 1) + ' faulted: ' + fl[j].join(', '))
+                        : (off ? ('J' + (j + 1) + ' not enabled') : '');
+      }
+      /* The target box is only overwritten while the user is NOT typing in it,
+         so a half-typed target is never clobbered by the 4 Hz status poll. */
+      var tin = el('jt' + k + j);
+      if (tin && document.activeElement !== tin && tin.getAttribute('data-dirty') !== '1') {
+        var tv = (a.targets && typeof a.targets[j] === 'number') ? a.targets[j]
+               : ((typeof v === 'number') ? v : null);
+        tin.value = (tv === null) ? '' : tv.toFixed(1);
+      }
+    }
+  }
+  function renderGripper(i) {
+    var a = state.arms[i], k = armKey(i);
+    setText(el('gripVal' + k), (typeof a.gripper === 'number') ? a.gripper.toFixed(1) + '\u00b0' : '--');
+  }
+  function renderArmPanel(i) {
+    var a = state.arms[i], k = armKey(i);
+    var en = a.jointsEnabled;
+    var n = en ? en.filter(Boolean).length : null;
+    var nf = 0, j;
+    if (a.faults) for (j = 0; j < 6; j++) if (a.faults[j] && a.faults[j].length) nf++;
+    // "enabled" means "at least one motor is live", so surface the count rather
+    // than a bare ENABLED that hides a dead joint.
+    var label = a.enabled ? 'ENABLED' : 'disabled';
+    if (a.enabled && n !== null && n < 6) label = 'ENABLED ' + n + '/6';
+    if (nf) label += ' \u00b7 ' + nf + ' FAULT';
+    setText(el('armState' + k), label);
+    setStyle(el('armState' + k), 'color',
+      nf ? 'var(--bad)' : (a.enabled ? (n !== null && n < 6 ? 'var(--warn)' : 'var(--ok)') : 'var(--muted)'));
+    var panel = el('panel' + k);
+    if (panel) panel.classList.toggle('armfaulted', nf > 0);
+    setText(el('armEnableBtn' + k), a.enabled ? 'Disable arm' : 'Enable arm');
+
+    var bad = [];
+    if (a.faults) for (j = 0; j < 6; j++) if (a.faults[j] && a.faults[j].length) bad.push('J' + (j + 1));
+    setText(el('armFault' + k), bad.length ? ('Faulted: ' + bad.join(', ') + ' \u2014 those joints will not enable') : '');
+    setText(el('armHome' + k), 'home pose (captured at server start): ' + fmtPose(a.home));
+    setText(el('ajTgt' + k), fmtPose(a.targets));
+  }
+  function renderStepCap() {
+    el('stepCap').textContent = state.limits.max_joint_step_deg;
+    var sel = el('stepSel'), opts = sel.options, i;
+    for (i = 0; i < opts.length; i++) {
+      opts[i].disabled = parseFloat(opts[i].value) > state.limits.max_joint_step_deg + 1e-9;
+    }
+    if (state.stepDeg > state.limits.max_joint_step_deg) {
+      state.stepDeg = state.limits.max_joint_step_deg;
+      sel.value = String(state.stepDeg);
+    }
+  }
+  el('stepSel').addEventListener('change', function () {
+    state.stepDeg = clamp(parseFloat(this.value) || 1, 0.1, state.limits.max_joint_step_deg);
+  });
+  /* ---- incremental nudge (one call per press; server clamps to the step) ---- */
+  function nudgeJoint(i, joint, dir, quiet) {
+    if (!mayDrive()) return;
+    var step = Math.min(state.stepDeg, state.limits.max_joint_step_deg);
+    api('POST', '/api/arm', { joint: joint, delta_deg: r4(dir * step), arm: i }, 2500).then(function (r) {
+      if (r && Array.isArray(r.joints_deg)) {
+        state.arms[i].joints = r.joints_deg.slice(0, 6);
+        renderJoints(i); markVizDirty(i);
+      } else if (!r && !quiet) {
+        toast(armTitle(i) + ' nudge failed (J' + (joint + 1) + ')', true);
+      }
+    });
+  }
+  function nudgeGripper(i, dir) {
+    if (!mayDrive()) return;
+    var step = Math.min(state.stepDeg, state.limits.max_joint_step_deg);
+    api('POST', '/api/gripper', { delta_deg: r4(dir * step), arm: i }, 2500).then(function (r) {
+      if (r && typeof r.gripper_deg === 'number') { state.arms[i].gripper = r.gripper_deg; renderGripper(i); }
+      else if (!r) toast(armTitle(i) + ' gripper command failed', true);
+    });
+  }
+
+  /* ---- ABSOLUTE target angles -------------------------------------------------
+     Deliberately NOT clamped to `max_joint_step_deg`: that cap exists to keep a
+     single incremental nudge small, and applying it to an absolute target would
+     make it impossible to ever command a distant angle. The server clamps an
+     absolute target to the joint limits, which is the right authority. We only
+     reject values that are not numbers at all. */
+  function sendTargets(i, body, okMsg) {
+    if (!state.connected) { toast('No link to the robot', true); return; }
+    body.arm = i;
+    api('POST', '/api/arm/target', body, 4000).then(function (r) {
+      if (!r || r.ok !== true) { toast(armTitle(i) + ' target rejected', true); return; }
+      if (Array.isArray(r.targets_deg)) {
+        state.arms[i].targets = r.targets_deg.slice(0, 6);
+        renderJoints(i); renderArmPanel(i); markVizDirty(i);
+      }
+      toast(okMsg);
+    });
+  }
+  function sendOneTarget(i, joint) {
+    var k = armKey(i), tin = el('jt' + k + joint);
+    if (!tin) return;
+    var raw = (tin.value || '').trim();
+    var deg = parseFloat(raw);
+    if (raw === '' || !isFinite(deg)) { toast('Enter a number of degrees for J' + (joint + 1), true); return; }
+    tin.setAttribute('data-dirty', '0');
+    sendTargets(i, { joint: joint, deg: r4(deg) },
+      armTitle(i) + ' J' + (joint + 1) + ' \u2192 ' + deg.toFixed(1) + '\u00b0');
+  }
+  function sendAllTargets(i) {
+    var k = armKey(i), a = state.arms[i], pose = [], j, t, deg;
+    for (j = 0; j < 6; j++) {
+      t = el('jt' + k + j);
+      deg = t ? parseFloat((t.value || '').trim()) : NaN;
+      if (!isFinite(deg)) deg = (typeof a.joints[j] === 'number') ? a.joints[j] : 0;
+      pose.push(r4(deg));
+    }
+    for (j = 0; j < 6; j++) { t = el('jt' + k + j); if (t) t.setAttribute('data-dirty', '0'); }
+    sendTargets(i, { joints_deg: pose }, armTitle(i) + ' \u2192 all 6 targets');
+  }
+
+  /* ---- enable / disable ---- */
+  function toggleArmEnable(i) {
+    if (!state.connected) { toast('No link to the robot', true); return; }
+    var a = state.arms[i], k = armKey(i), btn = el('armEnableBtn' + k);
+    var want = !a.enabled;
+    if (btn) btn.disabled = true;              /* enabling takes ~1-2s on the arm */
+    api('POST', '/api/arm/enable', { enable: want, arm: i }, 8000).then(function (r) {
+      /* restore from the CURRENT conditions, never blindly to enabled: an
+         E-STOP or a dropped link during the request must leave it disabled */
+      if (btn) btn.disabled = stopped() || !state.connected;
+      if (!r || typeof r.enabled !== 'boolean') { toast(armTitle(i) + ' enable/disable failed', true); return; }
+      a.enabled = r.enabled;
+      renderArmPanel(i);
+      if (!want) { toast(armTitle(i) + ' disabled'); return; }
+      // Enabling can succeed for only SOME motors - say so instead of a bland
+      // "enabled", which is how a dead joint used to go unnoticed.
+      pollStatus().then(function () {
+        var en = state.arms[i].jointsEnabled;
+        var n = en ? en.filter(Boolean).length : null;
+        var bad = [];
+        for (var j = 0; j < 6; j++) {
+          if (state.arms[i].faults && state.arms[i].faults[j] && state.arms[i].faults[j].length) bad.push('J' + (j + 1));
+        }
+        if (n !== null && n < 6) {
+          toast(armTitle(i) + ' enabled ' + n + '/6' + (bad.length ? ' \u2014 ' + bad.join(',') + ' faulted' : ''), true);
+        } else {
+          toast(armTitle(i) + ' enabled');
+        }
+      });
+    });
+  }
+
+  /* ---- one-click RESET: clears the latched motion fault, re-enables and
+         re-syncs the commanded target to the MEASURED position. No motion. ---- */
+  function resetArm(i) {
+    if (!state.connected) { toast('No link to the robot', true); return; }
+    var k = armKey(i), btn = el('armResetBtn' + k), a = state.arms[i];
+    if (btn) btn.disabled = true;
+    api('POST', '/api/arm/reset', { arm: i }, 8000).then(function (r) {
+      if (btn) btn.disabled = stopped() || !state.connected;
+      if (!r || r.ok !== true) { toast(armTitle(i) + ' reset failed', true); return; }
+      if (Array.isArray(r.joints_deg)) { a.joints = r.joints_deg.slice(0, 6); renderJoints(i); markVizDirty(i); }
+      if (typeof r.enabled === 'boolean') a.enabled = r.enabled;
+      /* Read the truth back from the server rather than guessing the count. */
+      pollStatus().then(function () {
+        var en = state.arms[i].jointsEnabled;
+        var n = en ? en.filter(Boolean).length : (a.enabled ? 6 : 0);
+        toast(armTitle(i) + ' reset \u2014 ' + n + '/6 enabled');
+        renderArmPanel(i);
+      });
+    });
+  }
+
+  /* ---- HOME: this one MOVES the arm, so it is gated behind an inline
+         confirmation (never window.confirm) that states plainly that it will
+         move and shows the pose it will move to. ---- */
+  function openHomeConfirm(i) {
+    if (!state.connected) { toast('No link to the robot', true); return; }
+    if (stopped()) { toast('E-STOP is active - clear it first', true); return; }
+    closeHomeConfirm();                     /* only one arm armed at a time */
+    var k = armKey(i), box = el('armHomeConfirm' + k);
+    if (!box) return;
+    var a = state.arms[i];
+    setText(el('armHomeConfirmText' + k),
+      'Move the ' + armTitle(i).toLowerCase() + ' to its home pose (' + fmtPose(a.home) + ')? THE ARM WILL MOVE.');
+    box.hidden = false;
+    state.homeConfirmArm = i;
+    /* An armed confirmation must never sit there indefinitely. */
+    state.homeConfirmTimer = setTimeout(function () {
+      closeHomeConfirm();
+      toast('Home cancelled (not confirmed)');
+    }, 10000);
+    var go = el('armHomeGo' + k);
+    if (go) { try { go.focus(); } catch (e) {} }
+  }
+  function closeHomeConfirm() {
+    if (state.homeConfirmTimer) { clearTimeout(state.homeConfirmTimer); state.homeConfirmTimer = null; }
+    for (var i = 0; i < ARM_DEFS.length; i++) {
+      var box = el('armHomeConfirm' + armKey(i));
+      if (box) box.hidden = true;
+    }
+    state.homeConfirmArm = null;
+  }
+  function doHome(i) {
+    closeHomeConfirm();
+    if (!mayDrive()) { toast('No link to the robot', true); return; }
+    var k = armKey(i), btn = el('armHomeBtn' + k);
+    if (btn) btn.disabled = true;
+    api('POST', '/api/arm/home', { arm: i }, 8000).then(function (r) {
+      if (btn) btn.disabled = stopped() || !state.connected;
+      if (!r || r.ok !== true) { toast(armTitle(i) + ' home failed', true); return; }
+      toast(armTitle(i) + ' moving home \u2192 ' + fmtPose(r.moving_to));
+      pollStatus();
+    });
+  }
+
+  function wireArmPanel(i) {
+    var k = armKey(i), j;
+    var eb = el('armEnableBtn' + k); if (eb) eb.addEventListener('click', function () { toggleArmEnable(i); });
+    var rb = el('armResetBtn' + k);  if (rb) rb.addEventListener('click', function () { resetArm(i); });
+    var hb = el('armHomeBtn' + k);   if (hb) hb.addEventListener('click', function () { openHomeConfirm(i); });
+    var hc = el('armHomeCancel' + k);if (hc) hc.addEventListener('click', function () { closeHomeConfirm(); });
+    var hg = el('armHomeGo' + k);    if (hg) hg.addEventListener('click', function () { doHome(i); });
+    var go = el('gripOpen' + k);     if (go) go.addEventListener('click', function () { nudgeGripper(i, 1); });
+    var gc = el('gripClose' + k);    if (gc) gc.addEventListener('click', function () { nudgeGripper(i, -1); });
+    var ag = el('armAllGo' + k);     if (ag) ag.addEventListener('click', function () { sendAllTargets(i); });
+    for (j = 0; j < 6; j++) {
+      (function (joint) {
+        var tin = el('jt' + k + joint);
+        if (tin) {
+          tin.addEventListener('input', function () { tin.setAttribute('data-dirty', '1'); });
+          tin.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); sendOneTarget(i, joint); }
+            else if (e.key === 'Escape') { tin.setAttribute('data-dirty', '0'); renderJoints(i); }
+          });
+        }
+        var gb = el('jg' + k + joint);
+        if (gb) gb.addEventListener('click', function () { sendOneTarget(i, joint); });
+      })(j);
+    }
+  }
+
+  /* hold-to-jog: one nudge on press, then repeat while held. Every timer is
+     tracked so blur / E-STOP / disconnect always clears it. */
+  var holds = new Set();
+  function stopAllHolds() {
+    holds.forEach(function (stop) { try { stop(); } catch (e) {} });
+    holds.clear();
+  }
+  function holdRepeat(node, fire) {
+    var pid = null, timer = null;
+    function stop(e) {
+      if (pid === null) return;
+      if (e && e.pointerId !== undefined && e.pointerId !== pid) return;
+      try { node.releasePointerCapture(pid); } catch (err) {}
+      if (timer) { clearInterval(timer); timer = null; }
+      pid = null;
+      holds.delete(stop);
+    }
+    node.addEventListener('pointerdown', function (e) {
+      if (pid !== null) return;
+      e.preventDefault();
+      markGesture();
+      pid = e.pointerId;
+      try { node.setPointerCapture(pid); } catch (err) {}
+      holds.add(stop);
+      fire();
+      timer = setInterval(function () { if (mayDrive()) fire(); else stop(); }, 220);
+    });
+    node.addEventListener('pointerup', stop);
+    node.addEventListener('pointercancel', stop);
+    node.addEventListener('lostpointercapture', stop);
+    node.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  }
+  (function initJointButtons() {
+    var btns = document.querySelectorAll('.jbtn');
+    for (var i = 0; i < btns.length; i++) {
+      (function (b) {
+        var arm = parseInt(b.getAttribute('data-arm'), 10);
+        if (!isFinite(arm)) arm = 0;            /* defensive: default to left */
+        var joint = parseInt(b.getAttribute('data-joint'), 10);
+        var dir = parseInt(b.getAttribute('data-dir'), 10);
+        holdRepeat(b, function () { nudgeJoint(arm, joint, dir, false); });
+      })(btns[i]);
+    }
+  })();
+
+  /* =====================================================================
+     13c. Arm jog stick - one per arm, deliberately separate from the chassis
+     ---------------------------------------------------------------------
+     Horizontal = J1 (base yaw); vertical = the joint chosen in the select
+     (J2 shoulder by default, J3 elbow, or both together). It streams SMALL
+     INCREMENTAL nudges through the ordinary /api/arm endpoint while held - it
+     is never a velocity command - so letting go simply stops sending and the
+     arm holds wherever it is. Stopped on release, pointercancel, blur,
+     E-STOP and link loss.
+     ===================================================================== */
+  function stopArmJogs() {
+    if (!armJogStops) return;
+    for (var i = 0; i < armJogStops.length; i++) { try { armJogStops[i](); } catch (e) {} }
+  }
+  function initArmJog(i) {
+    var k = armKey(i);
+    var st = el('ajStick' + k), puck = el('ajPuck' + k), sel = el('ajYSel' + k),
+        val = el('ajVal' + k), lab = el('ajYLab' + k);
+    if (!st) return;
+    var pid = null, timer = null, vec = { x: 0, y: 0 };
+    function yJoints() {
+      var v = sel ? sel.value : '1';
+      if (v === '2') return [2];
+      if (v === '3') return [1, 2];
+      return [1];
+    }
+    function yLabel() {
+      var v = sel ? sel.value : '1';
+      return v === '2' ? 'J3' : (v === '3' ? 'J2+J3' : 'J2');
+    }
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+      vec.x = 0; vec.y = 0;
+      if (pid !== null) { try { st.releasePointerCapture(pid); } catch (e) {} pid = null; }
+      if (puck) puck.style.transform = 'translate3d(0px,0px,0)';
+      if (st) st.classList.remove('dragging');
+      setText(val, 'idle');
+    }
+    function tick() {
+      if (!mayDrive()) { stop(); return; }     /* E-STOP / link loss ends the jog */
+      var step = Math.min(state.stepDeg, state.limits.max_joint_step_deg) * 0.4;
+      if (Math.abs(vec.x) > 0.02) nudgeJoint(i, 0, vec.x * step, true);
+      if (Math.abs(vec.y) > 0.02) {
+        var ys = yJoints(), n;
+        for (n = 0; n < ys.length; n++) nudgeJoint(i, ys[n], -vec.y * step, true);
+      }
+    }
+    function move(e) {
+      var r = st.getBoundingClientRect();
+      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      var maxR = Math.max(20, Math.min(r.width, r.height) / 2 - 27);
+      var dx = e.clientX - cx, dy = e.clientY - cy;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > maxR) { dx = dx / dist * maxR; dy = dy / dist * maxR; }
+      vec.x = deadzone(dx / maxR, STICK_DEADZONE);
+      vec.y = deadzone(dy / maxR, STICK_DEADZONE);
+      if (puck) puck.style.transform = 'translate3d(' + dx.toFixed(1) + 'px,' + dy.toFixed(1) + 'px,0)';
+      setText(val, 'J1 ' + (vec.x >= 0 ? '+' : '') + vec.x.toFixed(2)
+        + '  ' + yLabel() + ' ' + (-vec.y >= 0 ? '+' : '') + (-vec.y).toFixed(2));
+    }
+    st.addEventListener('pointerdown', function (e) {
+      if (pid !== null) return;
+      e.preventDefault();
+      markGesture();
+      pid = e.pointerId;
+      try { st.setPointerCapture(pid); } catch (err) {}
+      st.classList.add('dragging');
+      move(e);
+      tick();
+      timer = setInterval(tick, 140);          /* ~7 Hz of tiny nudges */
+    });
+    st.addEventListener('pointermove', function (e) { if (e.pointerId === pid) move(e); });
+    st.addEventListener('pointerup', function (e) { if (e.pointerId === pid) stop(); });
+    st.addEventListener('pointercancel', function (e) { if (e.pointerId === pid) stop(); });
+    st.addEventListener('lostpointercapture', function (e) { if (e.pointerId === pid) stop(); });
+    st.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    if (sel) sel.addEventListener('change', function () { if (lab) lab.textContent = yLabel(); });
+    if (lab) lab.textContent = yLabel();
+    armJogStops.push(stop);
+  }
+
+  /* =====================================================================
+     13d. Hand-rolled 3D pose view (no libraries, no CDN, works offline)
+     ---------------------------------------------------------------------
+     A 3x3 rotation + a translation, a lookAt camera, one perspective divide and
+     plain 2D line drawing. Forward kinematics uses the exact joint origins and
+     rpy from the robot's own piper_description.urdf; every Piper joint axis is
+     local Z. Angles arrive in DEGREES and are converted to radians.
+     ===================================================================== */
+  var FK_JOINTS = [
+    { o: [0, 0, 0.123],            r: [0, 0, 0] },
+    { o: [0, 0, 0],                r: [1.5708, -0.1359, -3.1416] },
+    { o: [0.28503, 0, 0],          r: [0, 0, -1.7939] },
+    { o: [-0.021984, -0.25075, 0], r: [1.5708, 0, 0] },
+    { o: [0, 0, 0],                r: [-1.5708, 0, 0] },
+    { o: [8.8259e-05, -0.091, 0],  r: [1.5708, 0, 0] }
+  ];
+  var FK_GRIPPER = [0, 0, 0.1358];
+
+  function mIdent() { return [1, 0, 0, 0, 1, 0, 0, 0, 1]; }        /* row-major 3x3 */
+  function mMul(A, B) {
+    var C = new Array(9), r, c;
+    for (r = 0; r < 3; r++) {
+      for (c = 0; c < 3; c++) {
+        C[r * 3 + c] = A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c];
+      }
+    }
+    return C;
+  }
+  function mApply(A, p) {
+    return [A[0] * p[0] + A[1] * p[1] + A[2] * p[2],
+            A[3] * p[0] + A[4] * p[1] + A[5] * p[2],
+            A[6] * p[0] + A[7] * p[1] + A[8] * p[2]];
+  }
+  function mRx(t) { var c = Math.cos(t), s = Math.sin(t); return [1, 0, 0, 0, c, -s, 0, s, c]; }
+  function mRy(t) { var c = Math.cos(t), s = Math.sin(t); return [c, 0, s, 0, 1, 0, -s, 0, c]; }
+  function mRz(t) { var c = Math.cos(t), s = Math.sin(t); return [c, -s, 0, s, c, 0, 0, 0, 1]; }
+  /* URDF rpy = fixed-axis roll, pitch, yaw, i.e. R = Rz(yaw) * Ry(pitch) * Rx(roll) */
+  function mRpy(r, p, y) { return mMul(mRz(y), mMul(mRy(p), mRx(r))); }
+  function vAdd(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+
+  /* The arm as 8 points in the base frame (base, the six joint origins, tip)
+     PLUS the final tool rotation - the gripper fork needs it, because J4 and J6
+     rotate about the tool axis itself and so do not move the tip point at all.
+     A bare stick figure physically cannot show wrist roll. */
+  function armPose(deg) {
+    var R = mIdent(), t = [0, 0, 0], pts = [[0, 0, 0]], i, j, tOrigin, Rj, th;
+    for (i = 0; i < 6; i++) {
+      j = FK_JOINTS[i];
+      tOrigin = vAdd(t, mApply(R, j.o));         /* this joint's origin, in base */
+      pts.push(tOrigin);
+      Rj = mMul(R, mRpy(j.r[0], j.r[1], j.r[2]));
+      th = ((deg && typeof deg[i] === 'number') ? deg[i] : 0) * Math.PI / 180;
+      R = mMul(Rj, mRz(th));                     /* every Piper joint axis is local Z */
+      t = tOrigin;
+    }
+    pts.push(vAdd(t, mApply(R, FK_GRIPPER)));
+    return { pts: pts, R: R, t: t };
+  }
+  function armSkeleton(deg) { return armPose(deg).pts; }
+
+  var ARM_VIEW = [{ az: 0.62, el: 0.30 }, { az: 0.62, el: 0.30 }];
+  var VIEW_HOME = { az: 0.62, el: 0.30 };
+
+  function makeCam(view) {
+    var dist = 1.45, target = [0.10, -0.06, 0.30];
+    var ce = Math.cos(view.el), se = Math.sin(view.el);
+    var eye = [target[0] + dist * ce * Math.cos(view.az),
+               target[1] + dist * ce * Math.sin(view.az),
+               target[2] + dist * se];
+    var f = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+    var fl = Math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) || 1;
+    f = [f[0] / fl, f[1] / fl, f[2] / fl];
+    var up = [0, 0, 1];
+    var r = [f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]];
+    var rl = Math.sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) || 1;
+    r = [r[0] / rl, r[1] / rl, r[2] / rl];
+    var u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+    return { eye: eye, right: r, up: u, fwd: f };
+  }
+  function project(p, cam, w, h) {
+    var d = [p[0] - cam.eye[0], p[1] - cam.eye[1], p[2] - cam.eye[2]];
+    var x = d[0] * cam.right[0] + d[1] * cam.right[1] + d[2] * cam.right[2];
+    var y = d[0] * cam.up[0] + d[1] * cam.up[1] + d[2] * cam.up[2];
+    var z = d[0] * cam.fwd[0] + d[1] * cam.fwd[1] + d[2] * cam.fwd[2];
+    if (z <= 0.02) return null;
+    var s = (h * 1.15) / z;                       /* ~47 deg vertical field of view */
+    return [w / 2 + x * s, h / 2 - y * s];
+  }
+
+  var vizDirty = [true, true];
+  function markVizDirty(i) { vizDirty[i] = true; }
+
+  function drawArm3D(i) {
+    var k = armKey(i), cv = el('viz' + k);
+    if (!cv || !cv.getContext) return;
+    var ctx = cv.getContext('2d');
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var w = cv.clientWidth || 300, h = cv.clientHeight || 170;
+    var W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    var a = state.arms[i];
+    var cam = makeCam(ARM_VIEW[i]);
+
+    function seg(p, q, col, wid, dash) {
+      var A = project(p, cam, w, h), B = project(q, cam, w, h);
+      if (!A || !B) return;
+      ctx.save();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = wid || 1;
+      if (dash) ctx.setLineDash(dash);
+      ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke();
+      ctx.restore();
+    }
+    function dot(p, col, rad) {
+      var A = project(p, cam, w, h);
+      if (!A) return;
+      ctx.beginPath(); ctx.arc(A[0], A[1], rad || 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = col; ctx.fill();
+    }
+    function tag(txt, p, col) {
+      var A = project(p, cam, w, h);
+      if (!A) return;
+      ctx.fillStyle = col || 'rgba(200,215,230,.75)';
+      ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillText(txt, A[0] + 3, A[1] - 3);
+    }
+
+    /* ground grid on z = 0, so the arm's orientation is readable */
+    var g, lim = 0.55, gs = 0.275;
+    for (g = -lim; g <= lim + 1e-9; g += gs) {
+      seg([g, -lim, 0], [g, lim, 0], 'rgba(143,163,182,.16)', 1);
+      seg([-lim, g, 0], [lim, g, 0], 'rgba(143,163,182,.16)', 1);
+    }
+    /* world axes, labelled */
+    seg([0, 0, 0], [0.28, 0, 0], '#e06c6c', 2); tag('X', [0.28, 0, 0], '#e06c6c');
+    seg([0, 0, 0], [0, 0.28, 0], '#6cd08a', 2); tag('Y', [0, 0.28, 0], '#6cd08a');
+    seg([0, 0, 0], [0, 0, 0.28], '#6c9ce0', 2); tag('Z', [0, 0, 0.28], '#6c9ce0');
+
+    function drawPose(pose, col, wid, dash, withFork) {
+      var pts = pose.pts, n;
+      for (n = 1; n < pts.length; n++) seg(pts[n - 1], pts[n], col, wid, dash);
+      for (n = 0; n < pts.length; n++) dot(pts[n], col, n === pts.length - 1 ? 3.5 : 2.5);
+      if (!withFork) return;
+      /* Gripper jaws: a short fork along the tool's own Y axis. This is the ONLY
+         way J4/J6 (wrist roll) become visible, because their rotation axis runs
+         straight through the tip point. */
+      var tip = pts[pts.length - 1];
+      var ax = mApply(pose.R, [0, 0.042, 0]);
+      seg(tip, vAdd(tip, ax), col, wid, dash);
+      seg(tip, [tip[0] - ax[0], tip[1] - ax[1], tip[2] - ax[2]], col, wid, dash);
+    }
+
+    /* ghost of the commanded target pose, so the gap to the goal is visible */
+    var hasTgt = false, n;
+    for (n = 0; n < 6; n++) if (a.targets && typeof a.targets[n] === 'number') hasTgt = true;
+    if (hasTgt) drawPose(armPose(a.targets), 'rgba(255,176,32,.8)', 2, [4, 3], true);
+    /* measured pose, drawn last so it sits on top */
+    drawPose(armPose(a.joints), '#4da3ff', 4, null, true);
+
+    ctx.font = '10px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = '#4da3ff'; ctx.fillText('\u25ac measured', 6, 12);
+    if (hasTgt) { ctx.fillStyle = '#ffb020'; ctx.fillText('\u25ac target', 6, 24); }
+  }
+
+  function initVizOrbit(i) {
+    var k = armKey(i), cv = el('viz' + k);
+    if (!cv) return;
+    var pid = null, lastX = 0, lastY = 0;
+    cv.addEventListener('pointerdown', function (e) {
+      if (pid !== null) return;
+      e.preventDefault();
+      markGesture();
+      pid = e.pointerId;
+      lastX = e.clientX; lastY = e.clientY;
+      try { cv.setPointerCapture(pid); } catch (err) {}
+      cv.classList.add('dragging');
+    });
+    cv.addEventListener('pointermove', function (e) {
+      if (e.pointerId !== pid) return;
+      var dx = e.clientX - lastX, dy = e.clientY - lastY;
+      lastX = e.clientX; lastY = e.clientY;
+      ARM_VIEW[i].az -= dx * 0.01;
+      ARM_VIEW[i].el = clamp(ARM_VIEW[i].el + dy * 0.01, -1.3, 1.3);
+      drawArm3D(i);                    /* user-driven, so draw immediately */
+    });
+    function end(e) {
+      if (pid === null) return;
+      if (e && e.pointerId !== undefined && e.pointerId !== pid) return;
+      try { cv.releasePointerCapture(pid); } catch (err) {}
+      pid = null;
+      cv.classList.remove('dragging');
+    }
+    cv.addEventListener('pointerup', end);
+    cv.addEventListener('pointercancel', end);
+    cv.addEventListener('lostpointercapture', end);
+    cv.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    cv.addEventListener('dblclick', function () {
+      ARM_VIEW[i].az = VIEW_HOME.az; ARM_VIEW[i].el = VIEW_HOME.el; drawArm3D(i);
+    });
+  }
+
+  /* Redraw the pose views at ~15 Hz and ONLY when something actually changed -
+     this is a timer, never the 60 Hz rAF loop, so it costs nothing while idle.
+     Under prefers-reduced-motion the view still updates when new data arrives
+     (a pose is data, not decoration) but nothing is ever animated: there is no
+     interpolation or easing anywhere in this renderer, and the puck's spring
+     transition is already neutralised by the global reduced-motion rule. */
+  setInterval(function () {
+    for (var i = 0; i < ARM_DEFS.length; i++) {
+      if (vizDirty[i]) { vizDirty[i] = false; drawArm3D(i); }
+    }
+  }, 66);
+
+  /* =====================================================================
+     14. Cameras (MJPEG in an <img>; "no signal" + reconnect)
+     ===================================================================== */
+  var CAMERAS = [
+    { cam: 0, img: 'camImg0', ns: 'camNs0' },
+    { cam: 2, img: 'camImg2', ns: 'camNs2' }
+  ];
+  var camState = {};
+  function camUrl(cam) { return '/video?cam=' + cam; }
+  function setNoSignal(c, on) {
+    el(c.ns).className = 'nosignal' + (on ? ' on' : '');
+  }
+  function startStream(c, isRetry) {
+    var img = el(c.img);
+    var st = camState[c.cam] || (camState[c.cam] = { tries: 0, watchdog: null, loaded: false });
+    if (st.watchdog) { clearTimeout(st.watchdog); st.watchdog = null; }
+    st.loaded = false;
+    /* Detach the handlers before clearing src: clearing it can itself fire an
+       error event in some browsers, which would look like a real stream drop. */
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute('src');
+    st.watchdog = setTimeout(function () { if (!st.loaded) setNoSignal(c, true); }, 6000);
+    /* Re-assigning the same src is what makes the browser open a NEW stream:
+       clearing it first forces the re-request. No cache-buster query is added,
+       so the URL stays exactly the contract's /video?cam=N. */
+    setTimeout(function () {
+      img.onload = function () {
+        st.loaded = true; st.tries = 0;
+        if (st.watchdog) { clearTimeout(st.watchdog); st.watchdog = null; }
+        setNoSignal(c, false);
+      };
+      img.onerror = function () {
+        st.loaded = false;
+        setNoSignal(c, true);
+        if (st.tries < 1) {                 /* one quiet auto-retry, then manual */
+          st.tries++;
+          setTimeout(function () { if (!st.loaded) startStream(c, true); }, 2500);
+        }
+      };
+      img.src = camUrl(c.cam);
+    }, 40);
+    if (!isRetry) setNoSignal(c, false);
+  }
+  (function initCams() {
+    var btns = document.querySelectorAll('[data-reconnect]');
+    for (var i = 0; i < btns.length; i++) {
+      (function (b) {
+        var cam = parseInt(b.getAttribute('data-reconnect'), 10);
+        b.addEventListener('click', function () {
+          var c = null;
+          for (var j = 0; j < CAMERAS.length; j++) if (CAMERAS[j].cam === cam) c = CAMERAS[j];
+          if (c) { camState[cam] = { tries: 0, watchdog: null, loaded: false }; startStream(c, false); toast('Reconnecting camera ' + cam); }
+        });
+      })(btns[i]);
+    }
+    for (var k = 0; k < CAMERAS.length; k++) startStream(CAMERAS[k], false);
+  })();
+
+  /* =====================================================================
+     15. Misc controls + lifecycle
+     ===================================================================== */
+  el('estopBtn').addEventListener('click', function () { triggerEstop('button'); });
+  el('estopClearBtn').addEventListener('click', clearEstop);
+  el('retryBtn').addEventListener('click', function () { pollStatus(); toast('Retrying…'); });
+  var speedEl = el('speed');
+  speedEl.addEventListener('input', function () {
+    state.speedPct = clamp(parseInt(this.value, 10) || 50, 10, 100);
+    renderDriveState();
+  });
+  speedEl.addEventListener('change', function () { markGesture(); });
+
+  window.addEventListener('pointerdown', markGesture, { passive: true });
+  window.addEventListener('touchstart', markGesture, { passive: true });
+
+  /* rotation / resize: a layout change mid-drag must not leave the robot
+     driving, so an active stick drag is released and zeroed. */
+  function onViewportChange() {
+    if (stickPid !== null) { stickRelease(true); }
+    markVizDirty(0); markVizDirty(1);          /* canvases changed size */
+  }
+  window.addEventListener('orientationchange', onViewportChange);
+  window.addEventListener('resize', function () { renderDriveState(); markVizDirty(0); markVizDirty(1); });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function () { renderDriveState(); markVizDirty(0); markVizDirty(1); });
+  }
+  window.addEventListener('pagehide', function () { zeroAllSources(); });
+
+  /* =====================================================================
+     16. Boot
+     ===================================================================== */
+  for (var bi = 0; bi < ARM_DEFS.length; bi++) {
+    wireArmPanel(bi);
+    initArmJog(bi);
+    initVizOrbit(bi);
+    renderJoints(bi);
+    renderGripper(bi);
+    renderArmPanel(bi);
+    drawArm3D(bi);
+  }
+  renderEstop();
+  renderConnection();
+  renderGamepad();
+  renderStepCap();
+  renderDriveState();
+  pollStatus();
+  statusTimer = setInterval(pollStatus, 250);      /* ~4 Hz readouts, never faster */
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

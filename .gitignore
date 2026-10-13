@@ -1,0 +1,26 @@
+# build output / binaries
+android/build/
+*.apk
+*.apk.idsig
+*.idsig
+*.class
+*.dex
+*.jar
+
+# secrets and machine-local state
+.token
+.session
+*.pem
+*.key
+*password*
+spw
+
+# python
+__pycache__/
+*.pyc
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
