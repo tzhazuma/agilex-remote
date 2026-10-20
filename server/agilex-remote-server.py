@@ -31,6 +31,7 @@ EnableCommandedMode() on the chassis, which takes it out of RC-handset mode.
 That is inherent to ROS control - the physical remote stops driving it.
 """
 
+import csv
 import json
 import os
 import queue
@@ -670,6 +671,9 @@ class ArmBridge:
             "joints_enabled": list(self.joints_enabled),
             "faults": [list(f) for f in self.faults],
             "gripper_deg": round(self.gripper, 3),
+            # The commanded gripper position. For imitation learning this - not
+            # the measured angle - is the action the policy has to reproduce.
+            "gripper_target_deg": round(self._grip_target, 3),
             "error_code": self.error_code,
             "home_deg": list(self.home_deg),
             # Exposed so a shaking arm can be told apart from a saturated CPU:
@@ -699,6 +703,15 @@ def ffmpeg_cmd(dev):
 
 
 FRAME_TIMEOUT_S = 8.0
+
+# A camera that has just been opened can take much longer than FRAME_TIMEOUT_S
+# to deliver its first frame. Measured on this robot: cam2 (right arm) needs
+# around 9 seconds to cold-start, especially when the other camera is opening at
+# the same moment on the same USB bus. Using the steady-state timeout for the
+# FIRST frame made a fresh viewer give up before the camera was ready, which
+# looked like "the right camera is broken". Give first frames a longer budget;
+# a genuine stall later still trips at FRAME_TIMEOUT_S.
+FIRST_FRAME_TIMEOUT_S = float(os.environ.get("AGILEX_FIRST_FRAME_TIMEOUT", "20"))
 
 
 def release_device(dev):
@@ -813,6 +826,137 @@ class MjpegSource:
         log(f"video {self.dev}: released")
 
 
+class FrameHub:
+    """
+    One ffmpeg per camera, shared by every consumer.
+
+    WHY THIS EXISTS: V4L2 devices are EXCLUSIVE - a second opener gets EBUSY.
+    Verified on this robot: with one ffmpeg holding /dev/video0, a second one
+    failed with "Device or resource busy". So the live MJPEG view and the
+    episode recorder CANNOT each open the camera; the second would always fail.
+
+    Instead one source runs per camera and everyone reads the latest frame from
+    here. Reference counted, so the device is released when the last consumer
+    (a browser tab, the recorder, or both) goes away. This also fixes a latent
+    bug: two simultaneous viewers used to fight over the device.
+    """
+
+    def __init__(self, dev):
+        self.dev = dev
+        self._cond = threading.Condition()
+        self._latest = None
+        self._seq = 0
+        self._refs = 0
+        self._stop = threading.Event()
+        self._thread = None
+        self.fps = 0.0
+        self._err = None
+
+    # -- consumer lifecycle ---------------------------------------------------
+    def acquire(self):
+        """
+        Bump the refcount and make sure the single pump thread is alive.
+
+        The pump thread is created ONCE and lives for the process lifetime; it
+        holds the device only while refs > 0. That is deliberate. The first
+        version started a new thread whenever the count went 0 -> 1, but the old
+        thread needs up to FRAME_TIMEOUT_S to notice it should stop - so a quick
+        release/re-acquire left TWO threads racing for a device only one can
+        open. Observed live: after a stream closed and a recording began,
+        `cameras_warm` came back {0: False, 2: False} and one camera produced
+        zero frames for the whole episode.
+        """
+        with self._cond:
+            self._refs += 1
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._pump, daemon=True)
+                self._thread.start()
+            self._cond.notify_all()
+        return True
+
+    def release(self):
+        with self._cond:
+            self._refs = max(0, self._refs - 1)
+            self._cond.notify_all()
+
+    def wait(self, last_seq, timeout=FRAME_TIMEOUT_S):
+        """Block until a frame newer than last_seq exists. Returns (seq, jpg)."""
+        with self._cond:
+            # Wait when there is nothing to hand out yet (a fresh acquire leaves
+            # latest=None, seq=0) OR when the sequence has not moved since the
+            # caller's last frame. Testing only `seq == last_seq` made a COLD
+            # consumer return instantly with None and see zero frames - a real
+            # regression, caught by testing the standalone /video path rather
+            # than only the during-recording path.
+            if (self._latest is None or self._seq == last_seq) \
+                    and not self._stop.is_set():
+                self._cond.wait(timeout)
+            return self._seq, self._latest
+
+    def snapshot(self):
+        with self._cond:
+            return self._latest
+
+    def seq_now(self):
+        """Frame counter only - lets a caller tell a fresh frame from a repeat."""
+        with self._cond:
+            return self._seq
+
+    def stats(self):
+        with self._cond:
+            return {"dev": self.dev, "consumers": self._refs,
+                    "seq": self._seq, "fps": round(self.fps, 1),
+                    "error": self._err}
+
+    # -- producer -------------------------------------------------------------
+    def _pump(self):
+        """
+        One thread, for the life of the process. Idles while there are no
+        consumers and holds the device only while refs > 0, so the device is
+        never opened by two threads at once.
+        """
+        while not self._stop.is_set():
+            # Wait until somebody wants frames.
+            with self._cond:
+                while self._refs == 0 and not self._stop.is_set():
+                    self._cond.wait(0.5)
+                if self._stop.is_set():
+                    return
+            src = None
+            n = 0
+            t0 = time.time()
+            try:
+                release_device(self.dev)
+                src = MjpegSource(self.dev)
+                for jpg in src.frames():
+                    with self._cond:
+                        if self._refs == 0 or self._stop.is_set():
+                            break
+                        n += 1
+                        self._latest = jpg
+                        self._seq += 1
+                        if n % 10 == 0:
+                            el = time.time() - t0
+                            self.fps = n / el if el > 0 else 0.0
+                        self._cond.notify_all()
+            except Exception as e:
+                self._err = repr(e)
+                log(f"hub {self.dev} error: {e!r}")
+            finally:
+                if src is not None:
+                    src.close()
+                with self._cond:
+                    # Consumers that come back must not inherit a stale frame.
+                    if self._refs == 0:
+                        self._latest = None
+                        self._seq = 0
+                    self._cond.notify_all()
+            # Reopen if the stream died while still wanted (unplug, transient
+            # EBUSY, ...). Short backoff so a genuine failure does not spin.
+            time.sleep(0.4)
+        log(f"hub {self.dev}: stopped")
+
+
 # ----------------------------------------------------------------------------
 # Shared control state
 # ----------------------------------------------------------------------------
@@ -901,11 +1045,278 @@ class Control:
 
 
 # ----------------------------------------------------------------------------
+# Episode recorder
+# ----------------------------------------------------------------------------
+EPISODE_ROOT = os.environ.get("AGILEX_EPISODE_ROOT", "/home/agilex/agilex-data/episodes")
+RECORD_HZ = float(os.environ.get("AGILEX_RECORD_HZ", "10"))
+RECORD_MAX_S = float(os.environ.get("AGILEX_RECORD_MAX_S", "300"))
+
+
+class EpisodeRecorder:
+    """
+    Records one demonstration as a self-contained episode directory.
+
+    WHY IT LIVES HERE AND NOT IN ROSBAG: the ROS graph on this robot carries only
+    chassis topics - no camera images, no arm joints (cameras are read straight
+    from V4L2, arms are driven over CAN via piper_sdk). A rosbag would capture
+    none of what a policy needs. This process already holds images, joint angles
+    and commanded velocities at the same instant, so recording here is both
+    simpler and better synchronised.
+
+    Layout, one directory per episode:
+        episode_0001/
+            meta.json      task, notes, timing, outcome, counts
+            cam0/000001.jpg ...   left arm camera
+            cam2/000001.jpg ...   right arm camera
+            timeline.csv   one row per tick: t, frame, joint angles, gripper,
+                           commanded lin/ang, odometry
+    File names are deliberately the same tick index, so a row in timeline.csv
+    and the two images with that index are the same moment by construction.
+    """
+
+    def __init__(self, control, hubs, root=EPISODE_ROOT):
+        self.control = control
+        self.hubs = hubs
+        self.root = root
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+        self.active = False
+        self.episode_dir = None
+        self.meta = {}
+        self._count = 0
+        # Last frame seen per camera, so a tick can still emit an image when the
+        # source has not advanced (keeps every episode rectangular).
+        self._last_jpg = {}
+
+    # -- lifecycle ------------------------------------------------------------
+    def next_index(self):
+        """
+        Highest existing index + 1.
+
+        NOT len(existing)+1, which is what this did at first: it collides as soon
+        as the numbering has a gap or a higher index already exists. Observed
+        live - episode_0005 was left over from an earlier run, so four fresh
+        recordings in a row all computed index 5 and silently overwrote each
+        other, losing three episodes' worth of demonstrations.
+        """
+        try:
+            os.makedirs(self.root, exist_ok=True)
+            names = os.listdir(self.root)
+        except Exception:
+            names = []
+        highest = 0
+        for d in names:
+            m = re.match(r"episode_(\d+)$", d)
+            if m:
+                highest = max(highest, int(m.group(1)))
+        return highest + 1
+
+    def start(self, task="", notes=""):
+        with self._lock:
+            if self.active:
+                return {"ok": False, "error": "already recording",
+                        "episode": self.episode_dir}
+            idx = self.next_index()
+            ep = os.path.join(self.root, f"episode_{idx:04d}")
+            if os.path.isdir(ep) and os.listdir(ep):
+                # Belt and braces: never silently clobber an existing episode.
+                return {"ok": False, "error": f"{ep} already exists and is not empty"}
+            try:
+                for sub in ("cam0", "cam2"):
+                    os.makedirs(os.path.join(ep, sub), exist_ok=True)
+            except Exception as e:
+                return {"ok": False, "error": f"cannot create {ep}: {e}"}
+
+            self.episode_dir = ep
+            self.meta = {
+                "index": idx,
+                "task": task,
+                "notes": notes,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "record_hz": RECORD_HZ,
+                "cameras": {"cam0": "left arm", "cam2": "right arm"},
+                "frames": 0,
+                "duration_s": 0.0,
+                "success": None,
+            }
+            self._count = 0
+            self.active = True
+            self._stop.clear()
+            # Hold the cameras for the whole episode so one ffmpeg serves both
+            # the recorder and any live viewer.
+            for h in self.hubs.values():
+                h.acquire()
+            # Wait for each camera to deliver a first frame BEFORE the clock
+            # starts. Without this the opening seconds of an episode have no
+            # images at all - observed on a real recording: cam0's first jpg was
+            # frame 7, and cam2 (cold-starting on the same USB bus) did not
+            # produce until ~9 s in, so only 30 of 122 frames had a right-camera
+            # image. The dataset has to be rectangular to be trainable.
+            warmed = {}
+            deadline = time.time() + 12.0
+            for cam, hub in self.hubs.items():
+                while time.time() < deadline:
+                    if hub.snapshot() is not None:
+                        warmed[cam] = True
+                        break
+                    time.sleep(0.15)
+                warmed.setdefault(cam, False)
+            self.meta["cameras_warm"] = warmed
+            if not all(warmed.values()):
+                log(f"recorder: cameras not all warm at start: {warmed}")
+
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            log(f"recording started: {ep} (task={task!r}) warm={warmed}")
+            return {"ok": True, "episode": ep, "index": idx, "cameras_warm": warmed}
+
+    def stop(self, success=None):
+        with self._lock:
+            if not self.active:
+                return {"ok": False, "error": "not recording"}
+            self.active = False
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+        for h in self.hubs.values():
+            h.release()
+
+        self.meta["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self.meta["success"] = success
+        try:
+            with open(os.path.join(self.episode_dir, "meta.json"), "w") as f:
+                json.dump(self.meta, f, indent=2)
+        except Exception as e:
+            log(f"recorder: could not write meta.json: {e!r}")
+        log(f"recording stopped: {self.episode_dir} "
+            f"({self._count} frames, {self.meta['duration_s']:.1f}s, success={success})")
+        return {"ok": True, "episode": self.episode_dir,
+                "frames": self._count, "duration_s": self.meta["duration_s"]}
+
+    def status(self):
+        return {
+            "active": self.active,
+            "episode": self.episode_dir,
+            "frames": self._count,
+            "duration_s": round(self.meta.get("duration_s", 0.0), 2),
+            "root": self.root,
+            "record_hz": RECORD_HZ,
+            "hubs": [h.stats() for h in self.hubs.values()],
+        }
+
+    # -- capture loop ---------------------------------------------------------
+    def _loop(self):
+        ep = self.episode_dir
+        csv_path = os.path.join(ep, "timeline.csv")
+        t_start = time.time()
+        period = 1.0 / RECORD_HZ if RECORD_HZ > 0 else 0.1
+        try:
+            f = open(csv_path, "w", newline="")
+        except Exception as e:
+            log(f"recorder: cannot open {csv_path}: {e!r}")
+            self.active = False
+            for h in self.hubs.values():
+                h.release()
+            return
+
+        with f:
+            w = csv.writer(f)
+            header = ["t", "frame"]
+            # observation.state - what the robot measured
+            header += [f"L_j{i}" for i in range(6)] + ["L_grip"]
+            header += [f"R_j{i}" for i in range(6)] + ["R_grip"]
+            # action - what the operator COMMANDED. A behaviour-cloning policy
+            # learns to reproduce these, not the measured angles, so recording
+            # only the measured state would leave the dataset untrainable.
+            header += [f"L_t{i}" for i in range(6)] + ["L_tgrip"]
+            header += [f"R_t{i}" for i in range(6)] + ["R_tgrip"]
+            header += ["cmd_lin", "cmd_ang", "odom_x", "odom_y", "battery_v"]
+            # Source frame counters, so a consumer can tell a genuinely new
+            # camera frame from a repeated one (see the image block below).
+            header += ["cam0_seq", "cam2_seq"]
+            w.writerow(header)
+
+            nxt = t_start
+            while not self._stop.is_set():
+                now = time.time()
+                if now - t_start > RECORD_MAX_S:
+                    log(f"recorder: hit {RECORD_MAX_S}s cap, stopping")
+                    break
+                if now < nxt:
+                    time.sleep(min(period, nxt - now))
+                    continue
+                nxt += period
+
+                self._count += 1
+                frame = self._count
+                t = time.time() - t_start
+
+                # Images: the hub holds the newest frame, which is fine at 10 Hz
+                # against a 28 Hz source. ALWAYS write both cameras, repeating the
+                # previous frame if the source has not advanced - otherwise the
+                # episode is ragged (cam2 could miss 90 of 122 frames) and every
+                # consumer downstream has to handle holes. The cam*_seq columns
+                # record whether the frame was actually new.
+                seqs = {}
+                for cam, sub in ((0, "cam0"), (2, "cam2")):
+                    hub = self.hubs.get(cam)
+                    jpg = hub.snapshot() if hub else None
+                    seq = hub.seq_now() if hub else 0
+                    seqs[cam] = seq
+                    if jpg:
+                        self._last_jpg[cam] = jpg
+                    jpg = self._last_jpg.get(cam)
+                    if jpg:
+                        try:
+                            with open(os.path.join(ep, sub, f"{frame:06d}.jpg"), "wb") as im:
+                                im.write(jpg)
+                        except Exception as e:
+                            log(f"recorder: image write failed: {e!r}")
+
+                # State + action. Reading the cached state() keeps this off the
+                # CAN path - it must never block the 50 Hz control thread.
+                try:
+                    st = self.control.status()
+                except Exception:
+                    st = {}
+                arms = st.get("arms") or [{}, {}]
+                row = [round(t, 4), frame]
+                # observation.state
+                for a in (arms[0], arms[1] if len(arms) > 1 else {}):
+                    js = a.get("joints_deg") or [0.0] * 6
+                    row += [round(v, 3) for v in (list(js) + [0.0] * 6)[:6]]
+                    row.append(round(float(a.get("gripper_deg") or 0.0), 3))
+                # action
+                for a in (arms[0], arms[1] if len(arms) > 1 else {}):
+                    tg = a.get("targets_deg") or [0.0] * 6
+                    row += [round(v, 3) for v in (list(tg) + [0.0] * 6)[:6]]
+                    row.append(round(float(a.get("gripper_target_deg") or 0.0), 3))
+                ch = st.get("chassis") or {}
+                row += [round(float(ch.get("lin_x") or 0.0), 4),
+                        round(float(ch.get("ang_z") or 0.0), 4),
+                        round(float(ch.get("odom_x") or 0.0), 4),
+                        round(float(ch.get("odom_y") or 0.0), 4),
+                        ch.get("battery_v"),
+                        seqs.get(0, 0), seqs.get(2, 0)]
+                try:
+                    w.writerow(row)
+                except Exception as e:
+                    log(f"recorder: csv write failed: {e!r}")
+
+                self.meta["frames"] = self._count
+                self.meta["duration_s"] = round(t, 2)
+
+
+# ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     control = None
+    hubs = {}
+    recorder = None
     ui_bytes = b"<h1>remote-ui.html not installed</h1>"
 
     def log_message(self, *a):
@@ -982,63 +1393,53 @@ class Handler(BaseHTTPRequestHandler):
             self._deny()
             return
         if path == "/api/status":
-            self._json(self.control.status())
+            st = self.control.status()
+            # Surface recording state alongside everything else, so a client can
+            # show "recording..." without polling a second endpoint.
+            if self.recorder is not None:
+                st["recorder"] = self.recorder.status()
+            self._json(st)
             return
         if path == "/video":
             q = self.path.split("?", 1)[1] if "?" in self.path else ""
             m = re.search(r"cam=(\d+)", q)
             cam = int(m.group(1)) if m else 0
             dev = VIDEO_DEV.get(cam)
-            if not dev or not os.path.exists(dev):
+            hub = self.hubs.get(cam)
+            if not dev or not hub or not os.path.exists(dev):
                 self._json({"ok": False, "error": f"camera {cam} ({dev}) not present"}, 503)
                 return
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            src = None
-            done = False
-            attempt = 0
-            MAX_ATTEMPTS = 3
-            while not done and attempt < MAX_ATTEMPTS:
-                attempt += 1
-                src = None
-                produced = False
-                try:
-                    release_device(dev)
-                    src = MjpegSource(dev)
-                    for jpg in src.frames():
-                        produced = True
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
-                        self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
-                        self.wfile.write(jpg + b"\r\n")
-                    # NOTE: frames() also returns normally when it times out, so
-                    # "the for loop ended" does NOT mean success - only `produced`
-                    # does. Setting done=True here unconditionally silently
-                    # disabled the retry; that was a real bug.
-                    if produced:
-                        done = True
-                except (BrokenPipeError, ConnectionResetError):
-                    done = True          # client went away; do not retry
-                except Exception as e:
-                    log(f"video {cam} error: {e!r}")
-                    done = True
-                finally:
-                    # Release ffmpeg NOW. Without this the device stays busy and
-                    # the camera cannot be reopened - a real failure seen in testing.
-                    if src is not None:
-                        src.close()
-                if not produced and not done:
-                    # Opening a V4L2 device can transiently fail, especially right
-                    # after another stream on the same USB bus just closed. Seen
-                    # live: "no data for 8s" while the identical command worked by
-                    # hand seconds later. Back off and try again.
-                    if attempt < MAX_ATTEMPTS:
-                        log(f"video {cam}: attempt {attempt} produced nothing; retrying")
-                        time.sleep(2.5)
-                    else:
-                        log(f"video {cam}: gave up after {attempt} attempts")
-                        done = True
+            # ONE ffmpeg per camera lives in the hub; this handler only reads the
+            # newest frame. The old code opened the device here, which meant a
+            # second viewer - or the episode recorder - always lost with
+            # "Device or resource busy", because V4L2 is exclusive.
+            hub.acquire()
+            last = -1
+            first = True
+            try:
+                while True:
+                    # A cold camera needs longer for its very first frame; only
+                    # after that does the steady-state timeout apply.
+                    budget = FIRST_FRAME_TIMEOUT_S if first else FRAME_TIMEOUT_S
+                    seq, jpg = hub.wait(last, timeout=budget)
+                    if jpg is None or seq == last:
+                        log(f"video {cam}: no new frame in {budget:g}s - ending")
+                        break
+                    first = False
+                    last = seq
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode())
+                    self.wfile.write(jpg + b"\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass                      # client went away
+            except Exception as e:
+                log(f"video {cam} error: {e!r}")
+            finally:
+                hub.release()
             return
         self._json({"ok": False, "error": "not found"}, 404)
 
@@ -1125,6 +1526,18 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/chassis/clear-fault":
                 ok = c.ros.clear_fault()
                 self._json({"ok": ok, "error_code": c.ros.error_code})
+            elif path == "/api/record/start":
+                b = self._body()
+                rec = self.recorder
+                r = rec.start(task=b.get("task", ""), notes=b.get("notes", ""))
+                self._json(r)
+            elif path == "/api/record/stop":
+                b = self._body()
+                rec = self.recorder
+                # success may be true / false / null (unlabelled)
+                self._json(rec.stop(success=b.get("success")))
+            elif path == "/api/record/status":
+                self._json(self.recorder.status())
             elif path == "/api/estop":
                 c.set_estop(True)
                 log("E-STOP engaged")
@@ -1158,6 +1571,13 @@ def main():
         log("WARNING: no arms initialised - arm endpoints will report failure")
     ctl = Control(ros, arms)
     Handler.control = ctl
+    # One frame hub per camera. Both the live MJPEG view and the episode
+    # recorder read from these, because a V4L2 device cannot be opened twice -
+    # verified: a second ffmpeg gets "Device or resource busy".
+    hubs = {cam: FrameHub(dev) for cam, dev in VIDEO_DEV.items()}
+    Handler.hubs = hubs
+    Handler.recorder = EpisodeRecorder(ctl, hubs)
+    log(f"recorder ready: root={EPISODE_ROOT} at {RECORD_HZ:g} Hz")
     # Clear a latched chassis fault at startup. Without this the chassis keeps
     # reporting error_code 4 and silently ignores every cmd_vel, which is
     # indistinguishable from "the controller is broken". Logged loudly so a

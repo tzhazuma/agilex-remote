@@ -45,6 +45,96 @@ not see the topics.
 
 ---
 
+## Recording demonstrations
+
+The controller can record a demonstration end to end, because it already holds
+the images, the joint states and the commanded targets in one process. That
+matters here: the ROS graph on this robot carries **only chassis topics** — there
+is no `/camera/*` and no `/joint_states`, so `rosbag record -a` captures nothing
+a policy could learn from.
+
+```
+POST /api/record/start   {"task": "...", "notes": "..."}
+POST /api/record/stop    {"success": true|false}
+POST /api/record/status
+```
+
+Each episode becomes a self-contained directory:
+
+```
+episode_0007/
+    meta.json          task, timing, frame count, outcome, camera warm-up state
+    cam0/000001.jpg    left arm camera
+    cam2/000001.jpg    right arm camera
+    timeline.csv       one row per tick
+```
+
+`timeline.csv` holds **both** halves that exist in a demonstration:
+
+| columns | meaning |
+|---|---|
+| `L_j0..5`, `L_grip`, `R_j0..5`, `R_grip` | `observation.state` — measured |
+| `L_t0..5`, `L_tgrip`, `R_t0..5`, `R_tgrip` | `action` — **commanded target** |
+| `cmd_lin`, `cmd_ang`, `odom_x`, `odom_y` | chassis command and odometry |
+| `cam0_seq`, `cam2_seq` | source frame counter, so a repeated frame is detectable |
+
+Recording only the measured angles produces a dataset you cannot train on:
+behaviour cloning learns observation → *command*, not observation → itself.
+Image file names and the `frame` column share the same index, so row N and the
+two `00000N.jpg` files are the same instant by construction.
+
+### One camera, many consumers
+
+V4L2 devices are exclusive — a second `ffmpeg` on the same node fails with
+`Device or resource busy`. So each camera is owned by a single `FrameHub` that
+publishes the newest frame and is reference-counted; the live MJPEG view and the
+recorder both read from it. Without this, watching the camera and recording at
+the same time was impossible.
+
+## Exporting to LeRobot
+
+```bash
+tools/export-lerobot.py --episodes <episode dir> --out <dataset dir> --fps 10
+```
+
+Writes the LeRobot v2.1 layout: `meta/{info,tasks,episodes,stats}.json`,
+`data/chunk-000/*.parquet`, and one h264 mp4 per camera per episode.
+Requires `pyarrow`. Do **not** install it into system Python — ROS Humble depends
+on numpy 1.21.5, which a modern `pyarrow`/`torch` install will replace. Use a venv:
+
+```bash
+python3 -m venv ~/agilex-data/.venv-export
+~/agilex-data/.venv-export/bin/pip install pyarrow
+```
+
+## Baseline results
+
+`tools/bc-baseline.py` trains the smallest model that can prove the pipeline is
+sound: a small CNN over one camera plus an MLP over joint state, predicting the
+14 commanded targets.
+
+On 8 episodes / 643 frames, split by episode:
+
+| | |
+|---|---|
+| device | CUDA, RTX 4060, torch 2.14.1+cu130 |
+| params | 0.09 M |
+| train MSE | **0.0089** (mean error 0.11°) |
+| val MSE | **0.046** (mean error 0.64°) |
+
+The gate that matters is *can it fit at all*: if a tiny model cannot drive the
+training loss down, something upstream is wrong (misaligned frames, wrong
+columns, bad normalisation) and ACT would not help either. It passes, so the
+data path is sound.
+
+## A note on the odometry
+
+`/odom` and the reported `odom_x`/`odom_y` stay at zero on this robot even while
+it drives. The chassis **does** move — verified by camera frame differencing:
+2.6 mean-abs-diff while stationary versus 45 after driving for two seconds, with
+the scene visibly displaced. Do not treat zero odometry as "not moving"; use
+vision if you need a displacement signal.
+
 ## The five things that are easy to get wrong
 
 These are the reason this repo exists. All five were reproduced, not theorised.
