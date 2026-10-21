@@ -59,8 +59,8 @@ Stanford 的双臂遥操作 + ACT 论文。**我们的机器人形态（双 6 �
 
 | 模型 | 标签 | 含义 |
 |---|---|---|
-| `Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2` | lerobot, pi0, pi0-fast, **piper-h**, **agilex**, imitation-learning | π0-fast 在 Piper 上微调，任务是**盘子抓取** |
-| `Kavin60606/piper-pi0fast-multistage` | lerobot, **vla**, pi0-fast, **piper-robot**, curriculum-learning | 多阶段课程学习的 Piper π0-fast |
+| `MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2` | lerobot, pi0, pi0-fast, **piper-h**, **agilex**, imitation-learning | π0-fast 在 Piper 上微调，任务是**盘子抓取** |
+| `MODEL_AUTHOR/piper-pi0fast-multistage` | lerobot, **vla**, pi0-fast, **piper-robot**, curriculum-learning | 多阶段课程学习的 Piper π0-fast |
 
 > 验证方式：这两个模型通过 HuggingFace API（走 hf-mirror.com，官方域名被 DNS 污染）
 > 查到了真实元数据，`pipeline_tag: robotics`，Apache-2.0。**下载量 0、likes 0**，
@@ -206,5 +206,5 @@ lerobot-train \
 - [agilexrobotics/tracer_ros2](https://github.com/agilexrobotics/tracer_ros2) — 底盘官方 ROS2 包
 - [agilexrobotics](https://github.com/agilexrobotics/agilexrobotics) — 厂商仓库汇总
 - [ALOHA 双机械臂系统](https://www.roboticscenter.ai/guides/aloha-robot) — ACT 方法出处
-- [Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2](https://huggingface.co/Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2) — Piper 微调的 π0-fast（盘子抓取）
-- [Kavin60606/piper-pi0fast-multistage](https://huggingface.co/Kavin60606/piper-pi0fast-multistage) — Piper π0-fast 多阶段课程学习
+- [MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2](https://huggingface.co/MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2) — Piper 微调的 π0-fast（盘子抓取）
+- [MODEL_AUTHOR/piper-pi0fast-multistage](https://huggingface.co/MODEL_AUTHOR/piper-pi0fast-multistage) — Piper π0-fast 多阶段课程学习

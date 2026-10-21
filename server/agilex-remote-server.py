@@ -168,6 +168,9 @@ HW_MAX_SOURCE = os.environ.get(
     "linear 2.3 m/s documented (TRACER_UserManual_v1.2.pdf s1.2, via ugv_sdk/docs); "
     "angular 0.7853 rad/s is the v1 protocol 100%% reference, NOT a hardware rating")
 MAX_JOINT_STEP_DEG = float(os.environ.get("AGILEX_MAX_JOINT_STEP", "2.0"))
+# How far the held target may ever sit from the measured angle. Bounds the
+# damage if a motor stops following; see ArmBridge.nudge for why.
+MAX_TARGET_LAG_DEG = float(os.environ.get("AGILEX_MAX_TARGET_LAG", "15.0"))
 
 # Watchdog: how long after the last /api/drive the controller forces a stop.
 #
@@ -639,12 +642,42 @@ class ArmBridge:
             return list(self.joints)
 
     def nudge(self, joint, delta_deg):
+        """
+        Move the held target by a bounded step.
+
+        THE RUNAWAY GUARD BELOW IS NOT OPTIONAL. This used to accumulate into the
+        target with only the joint-limit clamp, so if a motor stopped following -
+        which really happens, e.g. the Piper motors fault with
+        motor_overheating/driver_error_status and stop tracking - the target kept
+        climbing while the arm stood still. Observed on a real recording session:
+        left J1 target reached 118 deg while the arm sat at 11 deg, a 107 deg gap
+        that would have swung violently the moment the motor recovered.
+
+        Two guards, both cheap:
+          1. If the joint is currently faulted, do not accumulate at all - hold
+             the target at the measured angle, because the arm cannot follow.
+          2. Never let the target sit further than MAX_TARGET_LAG_DEG from the
+             measured angle. If the arm cannot keep up, the target is pulled back
+             rather than allowed to run away.
+        """
         if not self.ok or not (0 <= joint <= 5):
             return None
         delta_deg = clamp(float(delta_deg), -MAX_JOINT_STEP_DEG, MAX_JOINT_STEP_DEG)
         lo, hi = self.limits[joint]
         with self.lock:
-            self.joints[joint] = clamp(self.joints[joint] + delta_deg, lo, hi)
+            measured = self._measured[joint]
+            faulted = bool(self.faults[joint])
+            if faulted:
+                # Cannot follow: park the target on reality instead of drifting.
+                self.joints[joint] = clamp(measured, lo, hi)
+                return list(self.joints)
+
+            want = self.joints[joint] + delta_deg
+            lag = want - measured
+            if abs(lag) > MAX_TARGET_LAG_DEG:
+                # Pull back to the allowed envelope around where the arm actually is.
+                want = measured + (MAX_TARGET_LAG_DEG if lag > 0 else -MAX_TARGET_LAG_DEG)
+            self.joints[joint] = clamp(want, lo, hi)
             return list(self.joints)
 
     def nudge_gripper(self, delta_deg):
