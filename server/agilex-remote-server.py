@@ -66,10 +66,10 @@ PORT = int(os.environ.get("AGILEX_REMOTE_PORT", "8765"))
 # Loopback is exempt: the Mac reaches this through an SSH tunnel, which has
 # already authenticated, so `ssh -L` users never see a login.
 #
-#   AGILEX_PASSWORD   - the password (default "changeme")
+#   AGILEX_PASSWORD   - the password (default "azuma")
 #   AGILEX_ALLOW_ANON - 1 disables the check entirely
 ALLOW_ANON = os.environ.get("AGILEX_ALLOW_ANON", "0") == "1"
-PASSWORD = os.environ.get("AGILEX_PASSWORD", "changeme")
+PASSWORD = os.environ.get("AGILEX_PASSWORD", "azuma")
 SESSION_FILE = os.environ.get("AGILEX_SESSION_FILE",
                               "/usr/local/share/agilex-remote/.session")
 COOKIE_NAME = "agilex_sid"
@@ -736,6 +736,9 @@ def ffmpeg_cmd(dev):
 
 
 FRAME_TIMEOUT_S = 8.0
+# How long /frame keeps a camera pump alive after the last request, so a
+# polling policy client does not restart ffmpeg on every control tick.
+FRAME_HOLD_S = float(os.environ.get("AGILEX_FRAME_HOLD", "30"))
 
 # A camera that has just been opened can take much longer than FRAME_TIMEOUT_S
 # to deliver its first frame. Measured on this robot: cam2 (right arm) needs
@@ -1433,6 +1436,58 @@ class Handler(BaseHTTPRequestHandler):
                 st["recorder"] = self.recorder.status()
             self._json(st)
             return
+        if path == "/frame":
+            # Single JPEG, for policy clients. /video is a multipart stream meant
+            # for an <img> tag; a client that only wants one frame per control
+            # tick would otherwise open a new stream each time, which restarts the
+            # ffmpeg consumer and costs ~1.7 s per grab - far too slow for a 5 Hz
+            # control loop. Reading the hub's newest frame is immediate, and it
+            # does not add a second consumer on an exclusive V4L2 device.
+            q = self.path.split("?", 1)[1] if "?" in self.path else ""
+            m = re.search(r"cam=(\d+)", q)
+            cam = int(m.group(1)) if m else 0
+            hub = self.hubs.get(cam)
+            if not hub:
+                self._json({"ok": False, "error": f"camera {cam} not configured"}, 503)
+                return
+
+            # The pump only runs while refs > 0, so the first /frame for a camera
+            # has to acquire. We then HOLD that ref for FRAME_HOLD_S after the
+            # last request: a policy client polls at a few Hz, and releasing on
+            # every request would stop and restart ffmpeg each tick (cold start
+            # is ~9 s on cam2). The ref is given back by the sweep below.
+            now = time.time()
+            with self.server.frame_lock:
+                held = self.server.frame_held.get(cam)
+                if held is None:
+                    hub.acquire()
+                    self.server.frame_held[cam] = now
+                    log(f"/frame: acquired camera {cam} for a policy client")
+                else:
+                    self.server.frame_held[cam] = now
+            # sweep: release cameras nobody has asked for in a while
+            with self.server.frame_lock:
+                for c, last in list(self.server.frame_held.items()):
+                    if now - last > FRAME_HOLD_S:
+                        h = self.hubs.get(c)
+                        if h:
+                            h.release()
+                        del self.server.frame_held[c]
+                        log(f"/frame: released camera {c} after {FRAME_HOLD_S}s idle")
+
+            last_frame = hub.wait(None, timeout=FRAME_TIMEOUT_S)
+            jpg = last_frame if isinstance(last_frame, (bytes, bytearray)) else hub.snapshot()
+            if jpg is None:
+                self._json({"ok": False, "error": f"camera {cam} has no frame yet"}, 503)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpg)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(jpg)
+            return
+
         if path == "/video":
             q = self.path.split("?", 1)[1] if "?" in self.path else ""
             m = re.search(r"cam=(\d+)", q)
@@ -1625,6 +1680,11 @@ def main():
         log(f"WARNING: UI not found at {UI_PATH}")
 
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    # Shared state for the /frame hold: which cameras a policy client has asked
+    # for recently, and the lock guarding it. ThreadingHTTPServer instantiates a
+    # new Handler per request, so this cannot live on the handler.
+    srv.frame_lock = threading.Lock()
+    srv.frame_held = {}
     srv.daemon_threads = True
     log(f"listening on http://{HOST}:{PORT}")
 
