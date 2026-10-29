@@ -147,7 +147,7 @@ Everything lives under `agilex-setup/`; the venv is `.venv-sim`. System Python
 was never touched. Base interpreter: Homebrew `python3.12` (3.12.16, arm64).
 
 ```bash
-cd <repo>
+cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
 
 /opt/homebrew/bin/python3.12 -m venv .venv-sim
 .venv-sim/bin/python -m pip install --upgrade pip
@@ -266,7 +266,7 @@ Consequences, all of which shaped this demo:
 ## 7. Reproducing
 
 ```bash
-cd <repo>
+cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
 
 # validate model + IK only (fast, no simulation)
 .venv-sim/bin/python tools/sim_piper.py --check

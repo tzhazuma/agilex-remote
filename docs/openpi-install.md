@@ -1,6 +1,6 @@
-# openpi (JAX) install on gpu-a + Piper π0-FAST checkpoint load
+# openpi (JAX) install on 5090a + Piper π0-FAST checkpoint load
 
-**Host:** `gpu-a` = <gpu-host> (4× RTX 5090 32 GB, driver 570.211.01, compute capability **12.0 = sm_120**)
+**Host:** `5090a` = <gpu-host> (4× RTX 5090 32 GB, driver 570.211.01, compute capability **12.0 = sm_120**)
 **Date:** 2026-10-22 01:20–01:56 CST
 **Verdict:** ✅ **JAX runs native sm_120 kernels** · ✅ **Piper checkpoint restores and loads into a stock openpi `pi0_fast` architecture** (better than the predicted "config missing" outcome)
 
@@ -240,7 +240,7 @@ Action means ≈0 with small std ⇒ these are **delta joint actions** (not abso
 
 ## 7. Artifacts
 
-| Path (on gpu-a) | What |
+| Path (on 5090a) | What |
 |---|---|
 | `/mnt/nas_datasets/<user>/agilex/openpi` | openpi checkout + `.venv` (Python 3.11.16, 7.7 GB) |
 | `/mnt/nas_datasets/<user>/agilex/openpi-logs/env.sh` | env with mirrors + NAS caches |

@@ -71,6 +71,8 @@ All POST, JSON, `arm` is `0` = left, `1` = right.
 | `/api/arm/mit` | `{arm, kp, kd, t_ref}` | scalars or 6-element lists |
 | `/api/arm/movec` | `{arm, points}` | exactly 3 poses, integer SDK units |
 | `/api/traj/load` | `{arm, name, points, dt}` | `points` = list of 6-angle poses |
+| `/api/traj/load-file` | `{arm, path, dt?}` | read `.json`, an episode `timeline.csv`, or a directory containing one |
+| `/api/traj/list` | `{}` | JSON trajectories + recorded episodes available to load |
 | `/api/traj/play` | `{arm, loop, speed}` | 0.1–4.0× |
 | `/api/traj/pause` / `/api/traj/stop` | `{arm}` | stop resyncs the target |
 | `/api/teach` | `{arm, on, execute}` | on = record, execute = replay |
@@ -78,6 +80,22 @@ All POST, JSON, `arm` is `0` = left, `1` = right.
 
 `/api/status` now also returns, per arm: `mode`, `teaching`, `mit`, `movec_active`,
 `traj {name, points, dt, idx, playing, loop, speed, plays}`, `master_slave`.
+
+### Replaying a trajectory from disk
+
+`/api/traj/load-file` accepts three shapes and picks the right parser:
+
+* `.json` — `{"name","dt","points":[[6 angles], …]}`, or a bare list of points.
+* an episode `timeline.csv` from this recorder — it uses the **commanded target**
+  columns `L_t0..L_t5` / `R_t0..R_t5`, not the measured `L_j*` columns, because a
+  replay should reproduce what was commanded.
+* a directory containing `timeline.csv`.
+
+`dt` is taken from the file (median spacing of the `t` column for a CSV) unless
+you override it. `/api/traj/list` returns what is loadable, and the UI shows it
+as a picker per arm. Verified on the robot: 42 items listed, `episode_0042`
+loaded as 170 points at 0.1 s, and a missing path rejected with
+`no such file: …`.
 
 ## What was verified, and what was not
 

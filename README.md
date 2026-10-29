@@ -359,8 +359,15 @@ hand-guided demos, or arm-to-arm mirroring.
 | Drag teach | `MotionCtrl_1(grag_teach_ctrl=0x01/0x02/0x03)` | Record by hand, then replay. |
 | Master/slave | `MasterSlaveConfig(0xFA leader / 0xFC follower)` | Left arm hand-guided, right arm mirrors it. |
 
-API: `POST /api/arm/mode`, `/api/arm/mit`, `/api/arm/movec`, `/api/traj/load|play|pause|stop`,
-`/api/teach`, `/api/master-slave`. All take `{"arm": 0|1, ...}`.
+API: `POST /api/arm/mode`, `/api/arm/mit`, `/api/arm/movec`,
+`/api/traj/load|load-file|list|play|pause|stop`, `/api/teach`, `/api/master-slave`.
+All take `{"arm": 0|1, ...}`.
+
+`/api/traj/load-file` replays a trajectory **from disk**: a `.json`
+(`{"name","dt","points"}`, or a bare list), an episode `timeline.csv` written by
+this recorder (it uses the commanded-target columns `L_t*` / `R_t*`, not the
+measured ones), or a directory containing one. `/api/traj/list` returns what is
+loadable and the UI offers it as a per-arm picker.
 
 Two things are **verified against the hardware, not assumed**:
 
@@ -421,7 +428,14 @@ Then open `http://<robot-ip>:8765/`. The web UI password comes from
 ## Tests
 
 ```bash
-python3 tools/test-modes-offline.py     # 46 assertions, fake CAN, no hardware
+python3 tools/test-modes-offline.py     # 41 assertions, fake CAN, no hardware
 ./scripts/verify-modes.sh               # 12 checks on the robot, no motion
 ./scripts/mode-smoke.sh                 # 23 checks on the robot, no motion
+./scripts/verify-bundle.sh <zip>        # prove the SHIPPED tree works, from a clean extract
 ```
+
+`verify-bundle.sh` exists because a stale copy of the test file was once copied
+over the fixed one, silently dropping the regression tests while the bundle
+still built and shipped. It extracts the zip to a throwaway directory, runs the
+shipped tests, checks every shell script parses, and scans for credentials and
+real addresses. Run it before publishing.

@@ -24,11 +24,24 @@ calls = []
 
 
 class FakeIface:
+    reported_mode = "MOVE_J"
+    pin_mode = False          # True = the arm refuses to change (regression test)
+
     def __init__(self, *a, **k):
         pass
 
+    def GetArmStatus(self):
+        class S:
+            pass
+        s = S()
+        s.arm_status = "Mode Feed: %s(0x1)\nArm Status: NORMAL(0x0)" % FakeIface.reported_mode
+        return s
+
     def MotionCtrl_2(self, **kw):
         calls.append(("MotionCtrl_2", kw))
+        if not FakeIface.pin_mode:
+            FakeIface.reported_mode = {0x00: "MOVE_P", 0x01: "MOVE_J",
+                                       0x03: "MOVE_C"}.get(kw.get("move_mode"), "MOVE_J")
 
     def MotionCtrl_1(self, **kw):
         calls.append(("MotionCtrl_1", kw))
@@ -99,6 +112,9 @@ def make_arm():
               "playing": False, "loop": False, "speed": 1.0,
               "t_next": 0.0, "plays": 0}
     a.master_slave = {"enabled": False, "role": None}
+    a.mode_actual = None
+    a.mode_verified = True
+    a._last_posp_sent = None
     a._stop = threading.Event()
     a.cmd_hz = 0.0
     a.feedback_hz = 0.0
@@ -213,6 +229,34 @@ check("master/slave cleared", a.master_slave["enabled"] is False)
 st = a.state()
 for key in ("mode", "teaching", "mit", "traj", "master_slave", "movec_active"):
     check(f"state() has {key}", key in st)
+
+# --- 8. REGRESSION: an arm that refuses the mode change must not be faked ---
+# This is the 2026-10-29 shaking bug: we asked for pos_j, the arm stayed in
+# MOVE_P, and we kept streaming position targets into its own planner.
+FakeIface.pin_mode = True
+FakeIface.reported_mode = "MOVE_P"
+a = make_arm()
+a.mode = "pos_p"
+ok = a.set_mode("pos_j")
+check("refused mode reported as failure", ok is False, ok)
+check("bookkeeping reverts to the arm's real mode", a.mode == "pos_p", a.mode)
+check("mode_verified is False", a.mode_verified is False, a.mode_verified)
+check("mode_actual records what the arm said", a.mode_actual == "MOVE_P", a.mode_actual)
+FakeIface.pin_mode = False
+FakeIface.reported_mode = "MOVE_J"
+
+# --- 9. resync must not invent a target error outside the limits -----------
+a = make_arm()
+a.limits = [(0.0, 180.0), (-170.0, 0.0)] + [(-150.0, 150.0)] * 4
+a._measured = [-2.06, 1.44] + [0.0] * 4      # observed on the real left arm
+a.joints = [0.0] * 6
+a._resync_target_locked()
+check("resync keeps a measured pose just outside the limits",
+      abs(a.joints[0] - (-2.06)) < 1e-9 and abs(a.joints[1] - 1.44) < 1e-9,
+      str(a.joints[:2]))
+a._measured[0] = 999.0
+a._resync_target_locked()
+check("resync still rejects absurd feedback", a.joints[0] < 200.0, str(a.joints[0]))
 
 print()
 if FAIL:

@@ -338,7 +338,7 @@ Both cameras were driven through this full pipeline successfully (`camera_r` = `
 
 ### 3.4 Image / video files delivered to the Mac
 
-All in `<repo>/evidence/`:
+All in `<home>/Documents/deepseek-harness/default-workspace/agilex-setup/evidence/`:
 
 | File | Size | What it is |
 |---|---|---|
@@ -478,7 +478,7 @@ No motion command of any kind was issued to any actuator. No `cmd_vel` was publi
 ## 8. Reproduce
 
 ```bash
-cd <repo>
+cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
 
 # CAN
 bin/rsudo.sh -c 'cd /home/agilex/piper_ros && bash ./can_config.sh'

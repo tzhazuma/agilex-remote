@@ -1,7 +1,7 @@
 # ACT training run — completion, loss analysis, and checkpoint validation
 
 **Date:** 2026-10-22 (Asia/Shanghai)
-**Host:** gpu-a / <gpu-host> (4× RTX 5090 32 GB)
+**Host:** 5090a / <gpu-host> (4× RTX 5090 32 GB)
 **Run dir:** `/mnt/nas_datasets/<user>/agilex/runs/act_pickplace`
 **Job:** `lerobot-train` 0.4.4, ACT, dataset `local/agilex_pickplace` (episodes 11–40)
 
@@ -259,7 +259,7 @@ ones above.
 
 ## 10. Reproduce
 
-Scripts live in `agilex-setup/` and are copied to `/mnt/nas_datasets/<user>/agilex/` on gpu-a:
+Scripts live in `agilex-setup/` and are copied to `/mnt/nas_datasets/<user>/agilex/` on 5090a:
 
 ```bash
 cd /mnt/nas_datasets/<user>/agilex

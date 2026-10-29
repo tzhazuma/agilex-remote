@@ -1,7 +1,7 @@
 # π0 / π0-FAST / OpenVLA on AgileX Piper — bounded feasibility check
 
 **Date:** 2026-10-22 (Asia/Shanghai)
-**Host inspected:** `gpu-a` (<gpu-host>) via `./ssh5090.sh a`
+**Host inspected:** `5090a` (<gpu-host>) via `./ssh5090.sh a`
 **Venv inspected:** `/mnt/nas_datasets/<user>/agilex/venv` — LeRobot **0.4.4**, torch **2.10.0+cu128**, Python **3.10.21**
 **Budget:** read/inspect only + one small isolated install (transformers into a `--target` dir, never into the shared venv) + one VRAM probe on GPU 3. Nothing was written into the venv, the ACT job's environment, or GPU 0.
 
@@ -12,7 +12,7 @@
 ## 0. Environment facts measured at the time of the check
 
 ```
-nvidia-smi (gpu-a):
+nvidia-smi (5090a):
   0, 21664 MiB used / 32607 MiB   <- ACT job (pid 959219; same pid also holds GPU 2 and 3)
   1, 30337 MiB used / 32607 MiB   <- leftover openpi serve_policy.py (pid 1682255, etime 33d)
   2, 23872 MiB used / 32607 MiB   <- ACT job

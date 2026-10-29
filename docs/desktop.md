@@ -564,7 +564,7 @@ echo "$ROS_DOMAIN_ID $ROS_LOCALHOST_ONLY"   # must print: 222 1
 I deliberately did **not** install this. The task allows installing at most **one** solution, and the primary needed no installation; adding a second daemon that mirrors the user's screen on port 5900 would also mean a second service exposed on a host whose **firewall is off**, while three other agents are actively mutating the same robot. Enable it only if NoMachine disappoints.
 
 ```bash
-cd <repo>
+cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
 
 # 1. install (0.9.16-8 is what jammy offers)
 ./bin/rsudo.sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y x11vnc'

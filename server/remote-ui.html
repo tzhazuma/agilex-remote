@@ -1298,6 +1298,14 @@
       +       ' aria-label="Stop trajectory playback on the ' + a.title + '">Stop</button>'
       +   '</div>'
       +   '<div class="kv"><span>trajectory</span><span id="trajInfo' + k + '">none loaded</span></div>'
+      +   '<div class="row" style="margin:6px 0 8px">'
+      +     '<select class="stepsel" id="trajSel' + k + '" style="flex:2 1 150px"'
+      +       ' aria-label="Trajectory file or recorded episode to load for the ' + a.title + '">'
+      +       '<option value="">(choose a file)</option>'
+      +     '</select>'
+      +     '<button class="armbtn" id="trajLoadBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 66px"'
+      +       ' aria-label="Load the selected trajectory from disk for the ' + a.title + '">Load</button>'
+      +   '</div>'
       +   '<div class="vizwrap">'
       +     '<canvas id="viz' + k + '" width="300" height="170" role="img"'
       +       ' aria-label="3D view of the ' + a.title + ' pose: solid line is measured, dashed amber is the commanded target"></canvas>'
@@ -1529,6 +1537,36 @@
     }).catch(function () { toast('Trajectory play failed'); });
   }
 
+  function refreshTrajList() {
+    api('POST', '/api/traj/list', {}, 6000).then(function (r) {
+      var items = (r && r.items) || [];
+      for (var i = 0; i < ARM_DEFS.length; i++) {
+        var sel = el('trajSel' + armKey(i));
+        if (!sel) continue;
+        var keep = sel.value;
+        var html = '<option value="">(choose a file)</option>';
+        for (var q = 0; q < items.length; q++) {
+          var it = items[q];
+          html += '<option value="' + it.path.replace(/"/g, '&quot;') + '">'
+               + (it.kind === 'episode' ? '\u25A0 ' : '\u25B8 ') + it.name + '</option>';
+        }
+        sel.innerHTML = html;
+        if (keep) sel.value = keep;
+      }
+    }).catch(function () {});
+  }
+
+  function loadTrajFile(i) {
+    var sel = el('trajSel' + armKey(i));
+    var p = sel ? sel.value : '';
+    if (!p) { toast('Pick a trajectory file first'); return; }
+    api('POST', '/api/traj/load-file', { arm: i, path: p }, 15000).then(function (r) {
+      if (r && r.ok) toast('Loaded ' + r.name + ' \u2014 ' + r.points + ' pts @ ' + (r.dt || 0).toFixed(3) + 's on ' + armTitle(i));
+      else toast('Load failed: ' + ((r && r.error) || 'unknown'));
+      pollStatus();
+    }).catch(function () { toast('Load failed'); });
+  }
+
   function stopTraj(i) {
     api('POST', '/api/traj/stop', { arm: i }, 5000).then(function () {
       toast('Trajectory stopped on ' + armTitle(i));
@@ -1658,6 +1696,7 @@
     var tex = el('teachExecBtn' + k);if (tex) tex.addEventListener('click', function () { teachExec(i); });
     var tpb = el('trajBtn' + k);     if (tpb) tpb.addEventListener('click', function () { playTraj(i); });
     var tsp = el('trajStopBtn' + k); if (tsp) tsp.addEventListener('click', function () { stopTraj(i); });
+    var tlb = el('trajLoadBtn' + k); if (tlb) tlb.addEventListener('click', function () { loadTrajFile(i); });
     for (j = 0; j < 6; j++) {
       (function (joint) {
         var tin = el('jt' + k + joint);

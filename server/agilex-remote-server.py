@@ -171,6 +171,11 @@ MAX_JOINT_STEP_DEG = float(os.environ.get("AGILEX_MAX_JOINT_STEP", "2.0"))
 # How far the held target may ever sit from the measured angle. Bounds the
 # damage if a motor stops following; see ArmBridge.nudge for why.
 MAX_TARGET_LAG_DEG = float(os.environ.get("AGILEX_MAX_TARGET_LAG", "15.0"))
+# How far outside the datasheet joint limits a "hold where you are" resync
+# may go. The arm really does rest a couple of degrees outside them (left
+# J2 -2.06 vs 0..180, J3 +1.44 vs -170..0), and clamping that away creates a
+# permanent target error the arm pushes against.
+RESYNC_MARGIN_DEG = float(os.environ.get("AGILEX_RESYNC_MARGIN", "5.0"))
 
 # Watchdog: how long after the last /api/drive the controller forces a stop.
 #
@@ -340,6 +345,101 @@ class RosBridge:
 # ----------------------------------------------------------------------------
 # Arm bridge: streams a held joint target at 50 Hz
 # ----------------------------------------------------------------------------
+TRAJ_DIR = os.environ.get("AGILEX_TRAJ_DIR", "/home/agilex/agilex-data/trajectories")
+
+
+def parse_trajectory_file(path, side="left"):
+    """Read a trajectory from disk. Returns (name, points, dt).
+
+    points are 6 angles per frame in degrees; dt is seconds per frame.
+    Raises ValueError with a readable message on anything unexpected - the HTTP
+    layer turns that into a 400 rather than a stack trace.
+    """
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    if os.path.isdir(path):
+        path = os.path.join(path, "timeline.csv")
+    if not os.path.isfile(path):
+        raise ValueError(f"no such file: {path}")
+    name = os.path.basename(os.path.dirname(path)) or os.path.basename(path)
+
+    if path.lower().endswith(".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict):
+            pts = doc.get("points") or doc.get("trajectory") or []
+            dt = float(doc.get("dt", 0.05))
+            name = doc.get("name") or name
+        else:
+            pts, dt = doc, 0.05
+        out = []
+        for p in pts:
+            vals = [float(v) for v in list(p)[:6]]
+            if len(vals) < 6:
+                raise ValueError("each point needs 6 angles")
+            out.append(vals)
+        return name, out, dt
+
+    # ---- csv ---------------------------------------------------------------
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 3:
+        raise ValueError("csv has no data rows")
+    head = [h.strip() for h in rows[0]]
+    # Prefer the commanded-target columns for this side; fall back to measured.
+    prefix = "L_" if side == "left" else "R_"
+    cols = [f"{prefix}t{i}" for i in range(6)]
+    if not all(c in head for c in cols):
+        cols = [f"{prefix}j{i}" for i in range(6)]
+    if not all(c in head for c in cols):
+        cols = None
+    idx = [head.index(c) for c in cols] if cols else None
+    t_i = head.index("t") if "t" in head else None
+
+    out, times = [], []
+    for r in rows[1:]:
+        if not r or len(r) < 2:
+            continue
+        try:
+            if idx is not None:
+                vals = [float(r[i]) for i in idx]
+            else:
+                vals = [float(v) for v in r[:6]]
+        except (ValueError, IndexError):
+            continue
+        out.append(vals)
+        if t_i is not None:
+            try:
+                times.append(float(r[t_i]))
+            except (ValueError, IndexError):
+                pass
+    if len(out) < 2:
+        raise ValueError("fewer than 2 usable rows")
+    dt = 0.05
+    if len(times) >= 2:
+        deltas = sorted(times[i + 1] - times[i] for i in range(len(times) - 1))
+        med = deltas[len(deltas) // 2]
+        if 0.001 <= med <= 1.0:
+            dt = med
+    return name, out, dt
+
+
+def list_trajectories():
+    """What the UI can offer: json trajectories plus recorded episodes."""
+    items = []
+    for root, tag in ((TRAJ_DIR, "trajectory"), (EPISODE_ROOT, "episode")):
+        try:
+            names = sorted(os.listdir(root))
+        except Exception:
+            continue
+        for n in names:
+            p = os.path.join(root, n)
+            if os.path.isdir(p) and os.path.isfile(os.path.join(p, "timeline.csv")):
+                items.append({"kind": tag, "name": n, "path": p})
+            elif os.path.isfile(p) and n.lower().endswith(".json"):
+                items.append({"kind": tag, "name": n, "path": p})
+    return items
+
+
 def bus_rx_packets(iface):
     """Kernel RX counter for a CAN interface, or None if it cannot be read.
 
@@ -400,6 +500,10 @@ class ArmBridge:
                      "playing": False, "loop": False, "speed": 1.0,
                      "t_next": 0.0, "plays": 0}
         self.master_slave = {"enabled": False, "role": None}
+        # What the ARM says it is in, as opposed to self.mode (bookkeeping).
+        self.mode_actual = None
+        self.mode_verified = True
+        self._last_posp_sent = None
         self._stop = threading.Event()
         self.cmd_hz = 0.0
         self.feedback_hz = 0.0
@@ -552,6 +656,19 @@ class ArmBridge:
                     # The arc is dispatched once by run_movec(); a JointCtrl
                     # stream here would override it on the next frame.
                     pass
+                elif self.mode == "pos_p":
+                    # MOVE P makes the arm plan its own path to the point. A 50 Hz
+                    # position stream makes that planner fight the stream - this
+                    # is what shook the arm on 2026-10-29. Send only on change.
+                    if j != self._last_posp_sent:
+                        try:
+                            self.iface.JointCtrl(*[int(round(v * 1000)) for v in j])
+                            self.iface.GripperCtrl_V3(int(round(g * 1000)), 0, 0x01, 0)
+                            self._last_posp_sent = list(j)
+                        except Exception as e:
+                            self.error_code = 1
+                            if n % 200 == 0:
+                                log(f"arm MOVE P send error: {e!r}")
                 else:
                     try:
                         self.iface.JointCtrl(*[int(round(v * 1000)) for v in j])
@@ -649,9 +766,7 @@ class ArmBridge:
                 # we last wanted you". Reset the target to measured first, under
                 # the lock, before any enable frame goes out.
                 with self.lock:
-                    for j in range(6):
-                        self.joints[j] = clamp(self._measured[j],
-                                               self.limits[j][0], self.limits[j][1])
+                    self._resync_target_locked()
                 log(f"arm {self.side} target resynced to measured before enable: "
                     + str([round(v, 1) for v in self.joints]))
                 # RESUME first. MotionCtrl_1(0x02) is the documented "resume"
@@ -738,6 +853,37 @@ class ArmBridge:
             log(f"arm {self.side} mode {self.mode} apply failed: {e!r}")
             return False
 
+    def _resync_target_locked(self):
+        """Adopt the measured pose as the held target. Caller holds self.lock.
+
+        This is "hold exactly where you are", so it must NOT hard-clamp: the arm
+        can sit slightly outside its nominal range, and clamping there invents a
+        permanent target error that the arm then pushes against (buzzing).
+        The margin still rejects obviously bogus feedback.
+        """
+        m = RESYNC_MARGIN_DEG
+        for j in range(6):
+            lo, hi = self.limits[j]
+            self.joints[j] = clamp(self._measured[j], lo - m, hi + m)
+
+    def _read_actual_mode(self):
+        """Ask the arm which move mode it is ACTUALLY in.
+
+        self.mode is only bookkeeping - a MotionCtrl_2 frame can be ignored, and
+        then we stream position targets into an arm that is planning its own
+        trajectory, which is exactly what shook the arm on 2026-10-29.
+        Returns e.g. "MOVE_J" / "MOVE_P" / "MOVE_C", or None if unreadable.
+        """
+        try:
+            st = self.iface.GetArmStatus()
+            txt = str(getattr(st, "arm_status", "") or "")
+            m = re.search(r"Mode Feed:\s*([A-Z_]+)", txt)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return None
+
     def set_mode(self, mode):
         """Switch control law. Resyncs the target to measured first.
 
@@ -755,12 +901,32 @@ class ArmBridge:
         self.teaching = False
         with self.lock:
             self.traj["playing"] = False
-            for j in range(6):
-                self.joints[j] = clamp(self._measured[j],
-                                       self.limits[j][0], self.limits[j][1])
+            self._resync_target_locked()
         old, self.mode = self.mode, mode
         ok = self._apply_mode()
-        log(f"arm {self.side} mode {old} -> {mode} (sent={ok})")
+        # Believe the hardware, not ourselves. One retry, then revert.
+        expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
+                  "movec": "MOVE_C", "mit": "MOVE_J"}[mode]
+        actual = None
+        for attempt in (1, 2):
+            time.sleep(0.35)
+            actual = self._read_actual_mode()
+            if actual is None or actual == expect:
+                break
+            log(f"arm {self.side} mode {mode}: arm still reports {actual} "
+                f"(attempt {attempt}), re-sending")
+            self._apply_mode()
+        self.mode_actual = actual
+        if actual is not None and actual != expect:
+            back = {"MOVE_J": "pos_j", "MOVE_P": "pos_p", "MOVE_C": "movec"}
+            self.mode = back.get(actual, "pos_j")
+            self.mode_verified = False
+            log(f"arm {self.side} mode {mode} REJECTED by the arm (it is in "
+                f"{actual}); bookkeeping reverted to {self.mode} so we do not "
+                f"stream into the wrong mode")
+            return False
+        self.mode_verified = True
+        log(f"arm {self.side} mode {old} -> {mode} (arm reports {actual}, sent={ok})")
         return ok
 
     def set_mit(self, kp=None, kd=None, t_ref=None):
@@ -836,14 +1002,21 @@ class ArmBridge:
             f"{len(pts)} points @ {dt:.3f}s")
         return {"ok": True, "name": name, "points": len(pts), "dt": dt}
 
+    def load_trajectory_file(self, path, dt=None):
+        """Load a trajectory from disk and hand it to load_trajectory()."""
+        try:
+            name, pts, file_dt = parse_trajectory_file(path, self.side)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return self.load_trajectory(name, pts, dt if dt else file_dt)
+
     def play_trajectory(self, loop=False, speed=1.0):
         with self.lock:
             if not self.traj["points"]:
                 return {"ok": False, "error": "no trajectory loaded"}
             # Start from where the arm actually is so the first frame is not a
             # jump: the trajectory may have been captured from another pose.
-            self.joints = [clamp(self._measured[j], self.limits[j][0],
-                                 self.limits[j][1]) for j in range(6)]
+            self._resync_target_locked()
             self.traj.update({"playing": True, "loop": bool(loop),
                               "idx": 0, "plays": 0,
                               "speed": max(0.1, min(float(speed), 4.0)),
@@ -862,8 +1035,7 @@ class ArmBridge:
     def stop_trajectory(self):
         with self.lock:
             self.traj.update({"playing": False, "idx": 0})
-            self.joints = [clamp(self._measured[j], self.limits[j][0],
-                                 self.limits[j][1]) for j in range(6)]
+            self._resync_target_locked()
         log(f"arm {self.side} trajectory stopped, target resynced to measured")
         return {"ok": True}
 
@@ -914,8 +1086,7 @@ class ArmBridge:
             if on:
                 with self.lock:
                     self.traj["playing"] = False
-                    self.joints = [clamp(self._measured[j], self.limits[j][0],
-                                         self.limits[j][1]) for j in range(6)]
+                    self._resync_target_locked()
                 self.iface.MotionCtrl_1(emergency_stop=0x00,
                                         track_ctrl=0x00, grag_teach_ctrl=0x01)
                 self.teaching = True
@@ -930,8 +1101,7 @@ class ArmBridge:
                                         track_ctrl=0x00, grag_teach_ctrl=0x02)
                 self.teaching = False
                 with self.lock:
-                    self.joints = [clamp(self._measured[j], self.limits[j][0],
-                                         self.limits[j][1]) for j in range(6)]
+                    self._resync_target_locked()
                 log(f"arm {self.side} drag-teach RECORD stopped")
             return {"ok": True, "teaching": self.teaching}
         except Exception as e:
@@ -967,8 +1137,7 @@ class ArmBridge:
                                              linkage_offset=0x00)
                 self.master_slave = {"enabled": False, "role": None}
                 with self.lock:
-                    self.joints = [clamp(self._measured[j], self.limits[j][0],
-                                         self.limits[j][1]) for j in range(6)]
+                    self._resync_target_locked()
                 log(f"arm {self.side} master/slave OFF")
             return {"ok": True, **self.master_slave}
         except Exception as e:
@@ -1078,6 +1247,8 @@ class ArmBridge:
             "jitter": {"cmd_hz": self.cmd_hz, "feedback_hz": self.feedback_hz},
             # ---- operating mode ----
             "mode": self.mode,
+            "mode_actual": self.mode_actual,
+            "mode_verified": self.mode_verified,
             "teaching": self.teaching,
             "mit": {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
                     "t_ref": list(self.mit["t_ref"])},
@@ -2035,6 +2206,12 @@ class Handler(BaseHTTPRequestHandler):
                 a = c.pick_arm(b)
                 self._json(a.load_trajectory(b.get("name"), b.get("points"),
                                              b.get("dt", 0.05)))
+            elif path == "/api/traj/load-file":
+                b = self._body()
+                a = c.pick_arm(b)
+                self._json(a.load_trajectory_file(b.get("path"), b.get("dt")))
+            elif path == "/api/traj/list":
+                self._json({"ok": True, "items": list_trajectories()})
             elif path == "/api/traj/play":
                 b = self._body()
                 a = c.pick_arm(b)
