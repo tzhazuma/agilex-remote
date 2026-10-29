@@ -54,7 +54,7 @@ status() {
 stop_all() {
   echo "stopping tracer_base + the remote server on the robot..."
   ssh_robot 'pkill -f tracer_base_node 2>/dev/null; sudo -n systemctl stop agilex-remote.service 2>/dev/null; echo stopped' 2>&1 | tail -2
-  launchctl bootout "gui/$(id -u)/com.azuma.agilex-remote-tunnel" 2>/dev/null && echo "tunnel agent stopped" || echo "(tunnel agent not running)"
+  launchctl bootout "gui/$(id -u)/com.example.agilex-remote-tunnel" 2>/dev/null && echo "tunnel agent stopped" || echo "(tunnel agent not running)"
 }
 
 case "${1:-}" in
@@ -114,8 +114,8 @@ echo "### 5. SSH tunnel for port $LOCAL_PORT ###"
 if tunnel_up; then
   echo "already up."
 else
-  if [ -f "$HOME/Library/LaunchAgents/com.azuma.agilex-remote-tunnel.plist" ]; then
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.azuma.agilex-remote-tunnel.plist" 2>/dev/null
+  if [ -f "$HOME/Library/LaunchAgents/com.example.agilex-remote-tunnel.plist" ]; then
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.example.agilex-remote-tunnel.plist" 2>/dev/null
     sleep 4
   fi
   if ! tunnel_up; then

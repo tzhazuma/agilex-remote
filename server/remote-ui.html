@@ -475,6 +475,12 @@
     <h2>Arms <span class="tag">left can_left &middot; right can_right</span></h2>
 
     <div class="row" style="margin-bottom:10px">
+      <button class="armbtn" id="msBtn" style="flex:1 1 180px"
+        aria-label="Toggle the master/slave link between the two arms. When on, the left arm is the hand-guided leader and the right arm mirrors it.">Master/slave OFF</button>
+      <span class="hint" style="flex:2 1 200px">Links the two arms: left = hand-guided <b>leader</b> (0xFA), right = <b>follower</b> (0xFC). While linked neither arm accepts commands from this page.</span>
+    </div>
+
+    <div class="row" style="margin-bottom:10px">
       <label class="hint" for="stepSel">nudge step (shared by both arms)</label>
       <select id="stepSel" class="stepsel" aria-label="Joint nudge step in degrees, shared by both arms">
         <option value="0.5">0.5&deg;</option>
@@ -853,6 +859,35 @@
     if (ce) {
       setClass(ce, 'chip ' + (num(a.errorCode) ? 'bad blink' : 'ok'));
       setText(ce, k + ' ERR ' + (num(a.errorCode) ? a.errorCode : '0'));
+    }
+
+    a.mode = ar.mode || 'pos_j';
+    a.teaching = !!ar.teaching;
+    a.traj = ar.traj || null;
+    var ms = ar.master_slave || {};
+    state.masterSlave = !!ms.enabled;
+
+    var msb = el('msBtn');
+    if (msb) {
+      setText(msb, ms.enabled ? 'Master/slave ON' : 'Master/slave OFF');
+      setClass(msb, 'armbtn' + (ms.enabled ? ' btn-danger' : ''));
+    }
+    var sel = el('modeSel' + k);
+    if (sel && document.activeElement !== sel) sel.value = a.mode;
+    var mt = el('modeTag' + k);
+    if (mt) setText(mt, MODE_LABEL[a.mode] || a.mode);
+    var tb = el('teachBtn' + k);
+    if (tb) {
+      setText(tb, a.teaching ? 'Teach \u25A0' : 'Teach \u25CF');
+      setClass(tb, 'armbtn' + (a.teaching ? ' btn-danger' : ''));
+    }
+    var ti = el('trajInfo' + k);
+    if (ti) {
+      var tr = a.traj;
+      setText(ti, (tr && tr.points)
+        ? (tr.name + ' \u00b7 ' + tr.points + ' pts \u00b7 ' +
+           (tr.playing ? '\u25B6 ' + tr.idx + '/' + tr.points : 'idle'))
+        : 'none loaded');
     }
 
     renderJoints(i);
@@ -1241,6 +1276,28 @@
       +     '<button class="armbtn btn-danger" id="armHomeBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 84px"'
       +       ' aria-label="Home the ' + a.title + ': MOVE it back to its home pose. Asks for confirmation first.">Home &#9888;</button>'
       +   '</div>'
+      +   '<div class="row" style="margin-bottom:8px">'
+      +     '<label class="hint" for="modeSel' + k + '">mode</label>'
+      +     '<select class="stepsel" id="modeSel' + k + '" data-arm="' + a.idx + '" style="flex:1 1 130px"'
+      +       ' aria-label="Control mode for the ' + a.title + '">'
+      +       '<option value="pos_j">MOVE J &mdash; joint position</option>'
+      +       '<option value="pos_p">MOVE P &mdash; point to point</option>'
+      +       '<option value="mit">MIT &mdash; impedance</option>'
+      +       '<option value="movec">MOVE C &mdash; Cartesian arc</option>'
+      +     '</select>'
+      +     '<span class="tag" id="modeTag' + k + '">MOVE J</span>'
+      +   '</div>'
+      +   '<div class="row" style="margin-bottom:8px">'
+      +     '<button class="armbtn" id="teachBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 92px"'
+      +       ' aria-label="Start or stop drag teaching on the ' + a.title + '. While recording the arm is hand-guided and accepts no commands.">Teach &#9679;</button>'
+      +     '<button class="armbtn btn-warn" id="teachExecBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 80px"'
+      +       ' aria-label="Replay the drag-taught trajectory on the ' + a.title + '. The arm will move.">Teach &#9654;</button>'
+      +     '<button class="armbtn" id="trajBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 92px"'
+      +       ' aria-label="Replay the loaded trajectory on the ' + a.title + '">Replay traj</button>'
+      +     '<button class="armbtn btn-warn" id="trajStopBtn' + k + '" data-arm="' + a.idx + '" style="flex:1 1 70px"'
+      +       ' aria-label="Stop trajectory playback on the ' + a.title + '">Stop</button>'
+      +   '</div>'
+      +   '<div class="kv"><span>trajectory</span><span id="trajInfo' + k + '">none loaded</span></div>'
       +   '<div class="vizwrap">'
       +     '<canvas id="viz' + k + '" width="300" height="170" role="img"'
       +       ' aria-label="3D view of the ' + a.title + ' pose: solid line is measured, dashed amber is the commanded target"></canvas>'
@@ -1434,6 +1491,63 @@
   }
 
   /* ---- enable / disable ---- */
+  // ---- operating modes ----------------------------------------------------
+  var MODE_LABEL = { pos_j: 'MOVE J', pos_p: 'MOVE P', mit: 'MIT', movec: 'MOVE C' };
+
+  function setArmMode(i, mode) {
+    api('POST', '/api/arm/mode', { arm: i, mode: mode }, 5000).then(function (r) {
+      if (r && r.ok) toast(armTitle(i) + ' mode: ' + (MODE_LABEL[mode] || mode));
+      else toast('Mode switch failed on ' + armTitle(i));
+      pollStatus();
+    }).catch(function () { toast('Mode switch failed on ' + armTitle(i)); });
+  }
+
+  function toggleTeach(i) {
+    var on = !(state.arms[i] && state.arms[i].teaching);
+    api('POST', '/api/teach', { arm: i, on: on }, 5000).then(function (r) {
+      if (!r || !r.ok) { toast('Teach request failed'); return; }
+      toast(on
+        ? 'Drag-teach RECORDING on ' + armTitle(i) + ' — guide it by hand, then Teach ▶ to replay'
+        : 'Drag-teach stopped on ' + armTitle(i));
+      pollStatus();
+    }).catch(function () { toast('Teach request failed'); });
+  }
+
+  function teachExec(i) {
+    if (!window.confirm('Replay the drag-taught trajectory on the ' + armTitle(i) + '?\n\nTHE ARM WILL MOVE. Keep the workspace clear.')) return;
+    api('POST', '/api/teach', { arm: i, on: false, execute: true }, 5000).then(function (r) {
+      toast(r && r.ok ? 'Drag-teach replay started on ' + armTitle(i) : 'Replay failed');
+      pollStatus();
+    }).catch(function () { toast('Replay failed'); });
+  }
+
+  function playTraj(i) {
+    api('POST', '/api/traj/play', { arm: i, loop: false, speed: 1.0 }, 5000).then(function (r) {
+      toast(r && r.ok ? 'Replaying ' + r.name + ' on ' + armTitle(i)
+                      : 'Nothing to replay — load a trajectory first');
+      pollStatus();
+    }).catch(function () { toast('Trajectory play failed'); });
+  }
+
+  function stopTraj(i) {
+    api('POST', '/api/traj/stop', { arm: i }, 5000).then(function () {
+      toast('Trajectory stopped on ' + armTitle(i));
+      pollStatus();
+    }).catch(function () {});
+  }
+
+  function toggleMasterSlave() {
+    var on = !state.masterSlave;
+    if (on && !window.confirm('Link the two arms (master/slave)?\n\nLEFT becomes the hand-guided leader, RIGHT mirrors it. Neither will accept commands from this page while linked.')) return;
+    api('POST', '/api/master-slave', { on: on, leader: 0, follower: 1 }, 8000).then(function (r) {
+      state.masterSlave = !!(r && r.enabled);
+      toast(r && r.ok ? (on ? 'Master/slave ON — left leads, right follows'
+                            : 'Master/slave OFF')
+                      : 'Master/slave request failed');
+      pollStatus();
+    }).catch(function () { toast('Master/slave request failed'); });
+  }
+
   function toggleArmEnable(i) {
     if (!state.connected) { toast('No link to the robot', true); return; }
     var a = state.arms[i], k = armKey(i), btn = el('armEnableBtn' + k);
@@ -1539,6 +1653,11 @@
     var go = el('gripOpen' + k);     if (go) go.addEventListener('click', function () { nudgeGripper(i, 1); });
     var gc = el('gripClose' + k);    if (gc) gc.addEventListener('click', function () { nudgeGripper(i, -1); });
     var ag = el('armAllGo' + k);     if (ag) ag.addEventListener('click', function () { sendAllTargets(i); });
+    var msel = el('modeSel' + k);    if (msel) msel.addEventListener('change', function () { setArmMode(i, this.value); });
+    var tcb = el('teachBtn' + k);    if (tcb) tcb.addEventListener('click', function () { toggleTeach(i); });
+    var tex = el('teachExecBtn' + k);if (tex) tex.addEventListener('click', function () { teachExec(i); });
+    var tpb = el('trajBtn' + k);     if (tpb) tpb.addEventListener('click', function () { playTraj(i); });
+    var tsp = el('trajStopBtn' + k); if (tsp) tsp.addEventListener('click', function () { stopTraj(i); });
     for (j = 0; j < 6; j++) {
       (function (joint) {
         var tin = el('jt' + k + joint);
@@ -1959,6 +2078,7 @@
   /* =====================================================================
      15. Misc controls + lifecycle
      ===================================================================== */
+  el('msBtn').addEventListener('click', toggleMasterSlave);
   el('estopBtn').addEventListener('click', function () { triggerEstop('button'); });
   el('estopClearBtn').addEventListener('click', clearEstop);
   el('retryBtn').addEventListener('click', function () { pollStatus(); toast('Retrying…'); });

@@ -66,10 +66,10 @@ PORT = int(os.environ.get("AGILEX_REMOTE_PORT", "8765"))
 # Loopback is exempt: the Mac reaches this through an SSH tunnel, which has
 # already authenticated, so `ssh -L` users never see a login.
 #
-#   AGILEX_PASSWORD   - the password (default "azuma")
+#   AGILEX_PASSWORD   - the password (default "changeme")
 #   AGILEX_ALLOW_ANON - 1 disables the check entirely
 ALLOW_ANON = os.environ.get("AGILEX_ALLOW_ANON", "0") == "1"
-PASSWORD = os.environ.get("AGILEX_PASSWORD", "azuma")
+PASSWORD = os.environ.get("AGILEX_PASSWORD", "changeme")
 SESSION_FILE = os.environ.get("AGILEX_SESSION_FILE",
                               "/usr/local/share/agilex-remote/.session")
 COOKIE_NAME = "agilex_sid"
@@ -340,6 +340,19 @@ class RosBridge:
 # ----------------------------------------------------------------------------
 # Arm bridge: streams a held joint target at 50 Hz
 # ----------------------------------------------------------------------------
+def bus_rx_packets(iface):
+    """Kernel RX counter for a CAN interface, or None if it cannot be read.
+
+    This is the only trustworthy "is anything alive on this bus" signal: the
+    SDK happily opens a socket on a dead bus and reports all-zero joints.
+    """
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/rx_packets") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
 class ArmBridge:
     """
     The Piper controller expects a continuous command stream, so we hold a target
@@ -370,6 +383,23 @@ class ArmBridge:
         self.gripper = 0.0
         self._grip_target = 0.0
         self.home_deg = [0.0] * 6     # captured at startup = the safe return pose
+        # ---- operating mode ------------------------------------------------
+        # mode is the CONTROL LAW the 50 Hz loop uses to produce motion:
+        #   pos_j  MOVE J + JointCtrl          (default; joint-space position)
+        #   pos_p  MOVE P + JointCtrl          (point-to-point, arm plans)
+        #   mit    MIT impedance + JointMitCtrl (compliant, needs kp/kd)
+        #   movec  MOVE C + EndPoseCtrl/MoveCAxisUpdateCtrl (Cartesian arc)
+        # Teaching and trajectory playback are orthogonal to mode: they change
+        # WHERE the target comes from, not how it is tracked.
+        self.mode = "pos_j"
+        self.mit = {"kp": [30.0] * 6, "kd": [2.0] * 6, "t_ref": [0.0] * 6,
+                    "vel_ref": [0.0] * 6}
+        self.teaching = False
+        self.movec = {"points": [], "active": False}
+        self.traj = {"name": None, "points": [], "dt": 0.05, "idx": 0,
+                     "playing": False, "loop": False, "speed": 1.0,
+                     "t_next": 0.0, "plays": 0}
+        self.master_slave = {"enabled": False, "role": None}
         self._stop = threading.Event()
         self.cmd_hz = 0.0
         self.feedback_hz = 0.0
@@ -380,9 +410,24 @@ class ArmBridge:
             # piper_init=False: we do NOT want the SDK's init sequence firing
             # frames on its own. Nothing is transmitted until we ask for it.
             self.iface.ConnectPort(can_init=False, piper_init=False, start_thread=True)
-            time.sleep(1.0)
+            # A bus with no powered node still opens fine and reports every joint
+            # as 0.0. Adopting that as the measured pose - and as home - is how
+            # "Home" ends up commanding an arbitrary all-zero pose. So require
+            # real traffic before declaring the arm usable.
+            rx0 = bus_rx_packets(channel)
+            time.sleep(2.0)
+            rx1 = bus_rx_packets(channel)
+            if rx0 is not None and rx1 is not None and rx1 <= rx0:
+                self.ok = False
+                log(f"arm {channel} ({side}) NO FEEDBACK: bus silent "
+                    f"(rx {rx0} -> {rx1} in 2 s). Arm unpowered, e-stop pressed, "
+                    f"or CAN cable off. Marking NOT ok; no target or home adopted.")
+                return
             self.ok = True
             self._read_measured()
+            # Record what the arm says it is in, so /api/status reports the
+            # hardware truth from the first second rather than "not verified".
+            self.mode_actual = self._read_actual_mode()
             # Adopt whatever the arm is already doing as our starting intent, so
             # an arm left enabled by a previous session is usable immediately.
             self.enabled = any(self.joints_enabled)
@@ -461,7 +506,10 @@ class ArmBridge:
             t0 = time.time()
             n += 1
             if self.enabled:
-                # Re-assert CAN-command mode periodically. Sending it only at
+                # Advance a playing trajectory first: it is a TARGET SOURCE, so
+                # it has to update self.joints before the frame goes out.
+                self._advance_trajectory(t0)
+                # Re-assert the ACTIVE mode periodically. Sending it only at
                 # enable time is NOT enough: an arm that was already enabled
                 # (e.g. left enabled by an earlier session) never received it,
                 # stayed in its previous mode, and moved a fraction of a degree
@@ -471,21 +519,47 @@ class ArmBridge:
                 if t0 - last_mode > 10.0:
                     last_mode = t0
                     try:
-                        self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01,
-                                                move_spd_rate_ctrl=self.SPEED_PCT)
+                        self._apply_mode()
                     except Exception as e:
                         if n % 200 == 0:
                             log(f"arm mode re-assert failed: {e!r}")
                 with self.lock:
                     j = list(self.joints)
                     g = self._grip_target
-                try:
-                    self.iface.JointCtrl(*[int(round(v * 1000)) for v in j])
-                    self.iface.GripperCtrl_V3(int(round(g * 1000)), 0, 0x01, 0)
-                except Exception as e:
-                    self.error_code = 1
-                    if n % 200 == 0:
-                        log(f"arm stream error: {e!r}")
+                    kp = list(self.mit["kp"])
+                    kd = list(self.mit["kd"])
+                    t_ref = list(self.mit["t_ref"])
+                    vel = list(self.mit["vel_ref"])
+                if self.teaching or self.master_slave["enabled"]:
+                    # Hand-guided (drag teach) or slaved to another arm: any
+                    # command frame from us would fight the operator / the link.
+                    pass
+                elif self.mode == "mit":
+                    # MIT impedance: position target plus per-motor stiffness and
+                    # damping. JointCtrl is ignored in this mode, so keeping the
+                    # old stream would make the arm look dead.
+                    try:
+                        for m in range(1, 7):
+                            self.iface.JointMitCtrl(m, j[m - 1] * 1000.0,
+                                                    vel[m - 1], kp[m - 1],
+                                                    kd[m - 1], t_ref[m - 1])
+                        self.iface.GripperCtrl_V3(int(round(g * 1000)), 0, 0x01, 0)
+                    except Exception as e:
+                        self.error_code = 1
+                        if n % 200 == 0:
+                            log(f"arm MIT stream error: {e!r}")
+                elif self.mode == "movec":
+                    # The arc is dispatched once by run_movec(); a JointCtrl
+                    # stream here would override it on the next frame.
+                    pass
+                else:
+                    try:
+                        self.iface.JointCtrl(*[int(round(v * 1000)) for v in j])
+                        self.iface.GripperCtrl_V3(int(round(g * 1000)), 0, 0x01, 0)
+                    except Exception as e:
+                        self.error_code = 1
+                        if n % 200 == 0:
+                            log(f"arm stream error: {e!r}")
             elapsed = time.time() - t_start
             if elapsed > 0:
                 self.cmd_hz = round(n / elapsed, 1)
@@ -560,6 +634,26 @@ class ArmBridge:
             return False
         try:
             if on:
+
+                # RESYNC THE TARGET BEFORE ENABLING - this is the fix for the arm
+                # lurching when it is switched back on.
+                #
+                # A disabled Piper arm goes limp, so gravity moves it. The held
+                # target does not follow. Observed on the real robot: the target
+                # stayed at the startup pose while the arm sagged roughly 20
+                # degrees away from it, so every re-enable snapped the arm back to
+                # the stale target - which looks exactly like "the arm is moving on
+                # its own", and is what prompted killing this service.
+                #
+                # Enabling must mean "hold where you are", never "jump to wherever
+                # we last wanted you". Reset the target to measured first, under
+                # the lock, before any enable frame goes out.
+                with self.lock:
+                    for j in range(6):
+                        self.joints[j] = clamp(self._measured[j],
+                                               self.limits[j][0], self.limits[j][1])
+                log(f"arm {self.side} target resynced to measured before enable: "
+                    + str([round(v, 1) for v in self.joints]))
                 # RESUME first. MotionCtrl_1(0x02) is the documented "resume"
                 # (0x01 = stop, 0x00 = invalid / no-op). Without it a latched
                 # motion fault keeps the arm in REACH_TARGET_POS_FAILED: it
@@ -572,8 +666,10 @@ class ArmBridge:
                     time.sleep(0.4)
                 except Exception:
                     pass
-                self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01,
-                                        move_spd_rate_ctrl=self.SPEED_PCT)
+                # Re-assert the ACTIVE mode, not hard-coded MOVE J: enabling
+                # after a MIT / MOVE C session must not silently drop the arm
+                # back into joint position mode.
+                self._apply_mode()
                 time.sleep(0.2)
                 for attempt in range(3):
                     self.iface.EnableArm(motor_num=7, enable_flag=0x02)
@@ -610,6 +706,274 @@ class ArmBridge:
         except Exception as e:
             log(f"arm enable failed: {e!r}")
             return False
+
+    # ---------------------------------------------------------------- modes
+    MODES = ("pos_j", "pos_p", "mit", "movec")
+
+    def _apply_mode(self):
+        """Push self.mode to the arm via MotionCtrl_2.
+
+        Must be called WITHOUT self.lock held (it does a CAN round-trip).
+        """
+        if not self.ok:
+            return False
+        try:
+            if self.mode == "mit":
+                # is_mit_mode=0xAD switches the joint driver to impedance; the
+                # position target then comes from JointMitCtrl, not JointCtrl.
+                self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01,
+                                        move_spd_rate_ctrl=self.SPEED_PCT,
+                                        is_mit_mode=0xAD)
+            elif self.mode == "movec":
+                self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x03,
+                                        move_spd_rate_ctrl=self.SPEED_PCT)
+            elif self.mode == "pos_p":
+                self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x00,
+                                        move_spd_rate_ctrl=self.SPEED_PCT)
+            else:
+                self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x01,
+                                        move_spd_rate_ctrl=self.SPEED_PCT)
+            return True
+        except Exception as e:
+            log(f"arm {self.side} mode {self.mode} apply failed: {e!r}")
+            return False
+
+    def set_mode(self, mode):
+        """Switch control law. Resyncs the target to measured first.
+
+        The resync matters for the same reason it does on enable: switching
+        MOVE J -> MIT makes the arm go compliant, so gravity moves it, and a
+        stale target would then be a spring pulling it somewhere unexpected.
+        """
+        if not self.ok:
+            return False
+        mode = str(mode or "").strip()
+        if mode not in self.MODES:
+            return False
+        if mode == self.mode:
+            return True
+        self.teaching = False
+        with self.lock:
+            self.traj["playing"] = False
+            for j in range(6):
+                self.joints[j] = clamp(self._measured[j],
+                                       self.limits[j][0], self.limits[j][1])
+        old, self.mode = self.mode, mode
+        ok = self._apply_mode()
+        log(f"arm {self.side} mode {old} -> {mode} (sent={ok})")
+        return ok
+
+    def set_mit(self, kp=None, kd=None, t_ref=None):
+        """Set MIT impedance gains. Per-joint lists or scalars, 6 motors."""
+        def _six(v, cur):
+            if v is None:
+                return list(cur)
+            if isinstance(v, (int, float)):
+                return [float(v)] * 6
+            out = [float(x) for x in list(v)[:6]]
+            return out + list(cur)[len(out):]
+
+        with self.lock:
+            self.mit["kp"] = _six(kp, self.mit["kp"])
+            self.mit["kd"] = _six(kd, self.mit["kd"])
+            self.mit["t_ref"] = _six(t_ref, self.mit["t_ref"])
+            return {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
+                    "t_ref": list(self.mit["t_ref"])}
+
+    def run_movec(self, points):
+        """Cartesian MOVE C through start -> via -> end.
+
+        points: [[X,Y,Z,RX,RY,RZ], ...] in the SDK's integer units
+        (0.001 mm and 0.001 deg). Exactly 3 points.
+        EXPERIMENTAL: implemented from the SDK docstrings, not yet exercised on
+        hardware, so the caller gets an explicit ok/error rather than a silent
+        no-op.
+        """
+        if not self.ok:
+            return {"ok": False, "error": "arm not connected"}
+        try:
+            pts = [[int(round(float(v))) for v in p[:6]] for p in (points or [])]
+        except Exception as e:
+            return {"ok": False, "error": f"bad points: {e!r}"}
+        if len(pts) != 3:
+            return {"ok": False,
+                    "error": "MOVE C needs exactly 3 points (start, via, end)"}
+        try:
+            self.iface.MoveCAxisUpdateCtrl(0x03)     # clear any previous arc
+            time.sleep(0.1)
+            self.iface.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x03,
+                                    move_spd_rate_ctrl=self.SPEED_PCT)
+            time.sleep(0.2)
+            for i, p in enumerate(pts):
+                self.iface.EndPoseCtrl(*p)
+                time.sleep(0.15)
+                self.iface.MoveCAxisUpdateCtrl(i)    # 0 start, 1 via, 2 end
+                time.sleep(0.15)
+            self.iface.MoveCAxisUpdateCtrl(0x03)     # execute
+            self.movec = {"points": pts, "active": True}
+            log(f"arm {self.side} MOVE C dispatched: {pts}")
+            return {"ok": True, "points": pts}
+        except Exception as e:
+            log(f"arm {self.side} MOVE C failed: {e!r}")
+            return {"ok": False, "error": repr(e)}
+
+    # ----------------------------------------------------------- trajectories
+    def load_trajectory(self, name, points, dt=0.05):
+        """Load a joint trajectory: points = [[6 deg], ...], dt seconds/frame."""
+        try:
+            pts = [[clamp(float(v), self.limits[j][0], self.limits[j][1])
+                    for j, v in enumerate(p[:6])] for p in (points or [])]
+        except Exception as e:
+            return {"ok": False, "error": f"bad points: {e!r}"}
+        if len(pts) < 2:
+            return {"ok": False, "error": "need at least 2 points"}
+        dt = max(0.01, min(float(dt), 1.0))
+        with self.lock:
+            self.traj.update({"name": str(name or "unnamed"), "points": pts,
+                              "dt": dt, "idx": 0, "playing": False,
+                              "loop": False, "speed": 1.0, "plays": 0})
+        log(f"arm {self.side} trajectory loaded: {name} "
+            f"{len(pts)} points @ {dt:.3f}s")
+        return {"ok": True, "name": name, "points": len(pts), "dt": dt}
+
+    def play_trajectory(self, loop=False, speed=1.0):
+        with self.lock:
+            if not self.traj["points"]:
+                return {"ok": False, "error": "no trajectory loaded"}
+            # Start from where the arm actually is so the first frame is not a
+            # jump: the trajectory may have been captured from another pose.
+            self.joints = [clamp(self._measured[j], self.limits[j][0],
+                                 self.limits[j][1]) for j in range(6)]
+            self.traj.update({"playing": True, "loop": bool(loop),
+                              "idx": 0, "plays": 0,
+                              "speed": max(0.1, min(float(speed), 4.0)),
+                              "t_next": time.time()})
+            self.teaching = False
+        log(f"arm {self.side} trajectory play: {self.traj['name']} "
+            f"loop={loop} speed={speed}")
+        return {"ok": True, "name": self.traj["name"],
+                "points": len(self.traj["points"])}
+
+    def pause_trajectory(self):
+        with self.lock:
+            self.traj["playing"] = False
+            return {"ok": True, "idx": self.traj["idx"]}
+
+    def stop_trajectory(self):
+        with self.lock:
+            self.traj.update({"playing": False, "idx": 0})
+            self.joints = [clamp(self._measured[j], self.limits[j][0],
+                                 self.limits[j][1]) for j in range(6)]
+        log(f"arm {self.side} trajectory stopped, target resynced to measured")
+        return {"ok": True}
+
+    def _advance_trajectory(self, now):
+        """Step the trajectory clock. Called from the 50 Hz loop."""
+        with self.lock:
+            tr = self.traj
+            if not tr["playing"] or not tr["points"]:
+                return
+            if now < tr["t_next"]:
+                return
+            pts = tr["points"]
+            i = tr["idx"]
+            if i >= len(pts):
+                if tr["loop"]:
+                    tr["idx"] = i = 0
+                    tr["plays"] += 1
+                else:
+                    tr["playing"] = False
+                    log(f"arm {self.side} trajectory finished: {tr['name']}")
+                    return
+            p = pts[i]
+            # Same runaway guard as the manual path: a trajectory captured on
+            # another arm must not yank this one across the room.
+            for j in range(6):
+                want = p[j]
+                meas = self._measured[j]
+                if want - meas > MAX_TARGET_LAG_DEG:
+                    want = meas + MAX_TARGET_LAG_DEG
+                elif meas - want > MAX_TARGET_LAG_DEG:
+                    want = meas - MAX_TARGET_LAG_DEG
+                self.joints[j] = clamp(want, self.limits[j][0],
+                                       self.limits[j][1])
+            tr["idx"] = i + 1
+            tr["t_next"] = now + tr["dt"] / tr["speed"]
+
+    # --------------------------------------------------------------- teaching
+    def set_teaching(self, on, execute=False):
+        """Drag-teach: 0x01 start record, 0x02 end record, 0x03 execute.
+
+        While recording, the 50 Hz loop sends NOTHING: a Piper can only be
+        hand-guided when no position target is being streamed at it. That is
+        why teaching is a first-class state and not just a mode.
+        """
+        if not self.ok:
+            return {"ok": False, "error": "arm not connected"}
+        try:
+            if on:
+                with self.lock:
+                    self.traj["playing"] = False
+                    self.joints = [clamp(self._measured[j], self.limits[j][0],
+                                         self.limits[j][1]) for j in range(6)]
+                self.iface.MotionCtrl_1(emergency_stop=0x00,
+                                        track_ctrl=0x00, grag_teach_ctrl=0x01)
+                self.teaching = True
+                log(f"arm {self.side} drag-teach RECORD started")
+            elif execute:
+                self.iface.MotionCtrl_1(emergency_stop=0x00,
+                                        track_ctrl=0x00, grag_teach_ctrl=0x03)
+                self.teaching = False
+                log(f"arm {self.side} drag-teach EXECUTE")
+            else:
+                self.iface.MotionCtrl_1(emergency_stop=0x00,
+                                        track_ctrl=0x00, grag_teach_ctrl=0x02)
+                self.teaching = False
+                with self.lock:
+                    self.joints = [clamp(self._measured[j], self.limits[j][0],
+                                         self.limits[j][1]) for j in range(6)]
+                log(f"arm {self.side} drag-teach RECORD stopped")
+            return {"ok": True, "teaching": self.teaching}
+        except Exception as e:
+            log(f"arm {self.side} teaching failed: {e!r}")
+            return {"ok": False, "error": repr(e)}
+
+    # ----------------------------------------------------------- master/slave
+    def set_master_slave(self, on, role=None):
+        """0xFA = teaching INPUT arm (leader), 0xFC = motion OUTPUT (follower).
+
+        Offsets are 0: both arms keep their own CAN base IDs, which matches the
+        current wiring (can_left / can_right on separate buses).
+        """
+        if not self.ok:
+            return {"ok": False, "error": "arm not connected"}
+        try:
+            if on:
+                cfg = 0xFA if role == "leader" else 0xFC
+                self.iface.MasterSlaveConfig(linkage_config=cfg,
+                                             feedback_offset=0x00,
+                                             ctrl_offset=0x00,
+                                             linkage_offset=0x00)
+                self.master_slave = {"enabled": True, "role": role}
+                # Neither end may also be commanded by us: the leader is moved
+                # by the operator's hand and the follower mirrors it.
+                with self.lock:
+                    self.traj["playing"] = False
+                log(f"arm {self.side} master/slave ON as {role} (0x{cfg:02X})")
+            else:
+                self.iface.MasterSlaveConfig(linkage_config=0x00,
+                                             feedback_offset=0x00,
+                                             ctrl_offset=0x00,
+                                             linkage_offset=0x00)
+                self.master_slave = {"enabled": False, "role": None}
+                with self.lock:
+                    self.joints = [clamp(self._measured[j], self.limits[j][0],
+                                         self.limits[j][1]) for j in range(6)]
+                log(f"arm {self.side} master/slave OFF")
+            return {"ok": True, **self.master_slave}
+        except Exception as e:
+            log(f"arm {self.side} master/slave failed: {e!r}")
+            return {"ok": False, "error": repr(e)}
 
     def set_target(self, joints_deg=None, joint=None, deg=None):
         """
@@ -712,6 +1076,21 @@ class ArmBridge:
             # Exposed so a shaking arm can be told apart from a saturated CPU:
             # cmd_hz should sit near RATE_HZ, feedback_hz near FEEDBACK_HZ.
             "jitter": {"cmd_hz": self.cmd_hz, "feedback_hz": self.feedback_hz},
+            # ---- operating mode ----
+            "mode": self.mode,
+            "teaching": self.teaching,
+            "mit": {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
+                    "t_ref": list(self.mit["t_ref"])},
+            "movec_active": bool(self.movec.get("active")),
+            "traj": {"name": self.traj["name"],
+                     "points": len(self.traj["points"]),
+                     "dt": self.traj["dt"],
+                     "idx": self.traj["idx"],
+                     "playing": self.traj["playing"],
+                     "loop": self.traj["loop"],
+                     "speed": self.traj["speed"],
+                     "plays": self.traj["plays"]},
+            "master_slave": dict(self.master_slave),
         }
 
     def estop(self):
@@ -1053,6 +1432,30 @@ class Control:
         if not (0 <= i < len(self.arms)):
             i = 0
         return self.arms[i]
+
+    def set_master_slave(self, on, leader=0, follower=1):
+        """Link two arms: leader = 0xFA teaching input, follower = 0xFC output.
+
+        Returns a per-arm result so the UI can show which end failed. Turning it
+        OFF is always attempted on BOTH arms even if one errored, because a
+        half-disabled link is worse than either state.
+        """
+        out = {}
+        if on:
+            if len(self.arms) < 2:
+                return {"ok": False, "error": "need two arms"}
+            li, fi = int(leader), int(follower)
+            if li == fi or not (0 <= li < len(self.arms)) or \
+               not (0 <= fi < len(self.arms)):
+                return {"ok": False, "error": "bad leader/follower indices"}
+            out["leader"] = self.arms[li].set_master_slave(True, "leader")
+            time.sleep(0.2)
+            out["follower"] = self.arms[fi].set_master_slave(True, "follower")
+        else:
+            for i, a in enumerate(self.arms):
+                out[f"arm{i}"] = a.set_master_slave(False)
+        ok = all(bool(v.get("ok")) for v in out.values())
+        return {"ok": ok, "enabled": bool(on), "results": out}
 
     def status(self):
         with self.lock:
@@ -1611,6 +2014,48 @@ class Handler(BaseHTTPRequestHandler):
                 a = c.pick_arm(b)
                 t = a.nudge_gripper(b.get("delta_deg", 0.0))
                 self._json({"ok": t is not None, "gripper_target_deg": t})
+            elif path == "/api/arm/mode":
+                b = self._body()
+                a = c.pick_arm(b)
+                ok = a.set_mode(b.get("mode"))
+                self._json({"ok": ok, "mode": a.mode,
+                            "modes": list(a.MODES)})
+            elif path == "/api/arm/mit":
+                b = self._body()
+                a = c.pick_arm(b)
+                g = a.set_mit(kp=b.get("kp"), kd=b.get("kd"),
+                              t_ref=b.get("t_ref"))
+                self._json({"ok": True, "mit": g, "mode": a.mode})
+            elif path == "/api/arm/movec":
+                b = self._body()
+                a = c.pick_arm(b)
+                self._json(a.run_movec(b.get("points")))
+            elif path == "/api/traj/load":
+                b = self._body()
+                a = c.pick_arm(b)
+                self._json(a.load_trajectory(b.get("name"), b.get("points"),
+                                             b.get("dt", 0.05)))
+            elif path == "/api/traj/play":
+                b = self._body()
+                a = c.pick_arm(b)
+                self._json(a.play_trajectory(loop=b.get("loop", False),
+                                             speed=b.get("speed", 1.0)))
+            elif path == "/api/traj/pause":
+                b = self._body()
+                self._json(c.pick_arm(b).pause_trajectory())
+            elif path == "/api/traj/stop":
+                b = self._body()
+                self._json(c.pick_arm(b).stop_trajectory())
+            elif path == "/api/teach":
+                b = self._body()
+                a = c.pick_arm(b)
+                self._json(a.set_teaching(bool(b.get("on", True)),
+                                          execute=bool(b.get("execute", False))))
+            elif path == "/api/master-slave":
+                b = self._body()
+                self._json(c.set_master_slave(bool(b.get("on", True)),
+                                              leader=b.get("leader", 0),
+                                              follower=b.get("follower", 1)))
             elif path == "/api/chassis/clear-fault":
                 ok = c.ros.clear_fault()
                 self._json({"ok": ok, "error_code": c.ros.error_code})

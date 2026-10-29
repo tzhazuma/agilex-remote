@@ -19,9 +19,9 @@
 # so the tunnel always lands on the right machine. It also means the robot's
 # x11vnc — which binds 127.0.0.1 only — is never exposed to the campus network.
 #
-# The standing tunnel is a launchd agent (com.azuma.agilex-vnc-tunnel,
+# The standing tunnel is a launchd agent (com.example.agilex-vnc-tunnel,
 # RunAtLoad + KeepAlive), the same pattern as the NoMachine tunnel
-# (com.azuma.agilex-nx-tunnel), so it survives reboots, VPN blips and wake from
+# (com.example.agilex-nx-tunnel), so it survives reboots, VPN blips and wake from
 # sleep. This script never touches the NoMachine agent.
 #
 # Robot side (see reports/vnc.md): systemd unit x11vnc.service, password file
@@ -35,7 +35,7 @@ REMOTE_PORT="${AGILEX_VNC_REMOTE_PORT:-5900}"
 SSH_ALIAS="${AGILEX_SSH_ALIAS:-agilex}"
 VNC_PW="${AGILEX_VNC_PASSWORD:-changeme}"
 VNC_APP="${AGILEX_VNC_APP:-/Applications/VNC Viewer.app}"
-LABEL="com.azuma.agilex-vnc-tunnel"
+LABEL="com.example.agilex-vnc-tunnel"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 

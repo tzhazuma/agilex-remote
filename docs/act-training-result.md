@@ -1,8 +1,8 @@
 # ACT training run — completion, loss analysis, and checkpoint validation
 
 **Date:** 2026-10-22 (Asia/Shanghai)
-**Host:** 5090a / GPU_HOST (4× RTX 5090 32 GB)
-**Run dir:** `/mnt/data/agilex/runs/act_pickplace`
+**Host:** gpu-a / <gpu-host> (4× RTX 5090 32 GB)
+**Run dir:** `/mnt/nas_datasets/<user>/agilex/runs/act_pickplace`
 **Job:** `lerobot-train` 0.4.4, ACT, dataset `local/agilex_pickplace` (episodes 11–40)
 
 ---
@@ -41,7 +41,7 @@ checkpoints/last        # copy of 020000
 `training_state/training_step.json` in 020000 reads `{"step": 20000}`.
 
 **Final checkpoint:**
-`/mnt/data/agilex/runs/act_pickplace/checkpoints/020000/pretrained_model/`
+`/mnt/nas_datasets/<user>/agilex/runs/act_pickplace/checkpoints/020000/pretrained_model/`
 (`model.safetensors` 206 MB, `config.json`, `train_config.json`, `policy_preprocessor.json`,
 `policy_postprocessor.json`, plus the normalizer/unnormalizer `*.safetensors`).
 
@@ -68,7 +68,7 @@ Consequences:
 
 ## 4. Loss — what the log does and does not contain
 
-⚠️ **`/mnt/data/agilex/train-act.log` is truncated.** It is only 215 KB and begins at
+⚠️ **`/mnt/nas_datasets/<user>/agilex/train-act.log` is truncated.** It is only 215 KB and begins at
 step 16,701 — the first ~33 minutes of the run were trimmed/rotated away. Only **33 loss lines**
 survive (steps 17K–20K):
 
@@ -259,13 +259,13 @@ ones above.
 
 ## 10. Reproduce
 
-Scripts live in `agilex-setup/` and are copied to `/mnt/data/agilex/` on 5090a:
+Scripts live in `agilex-setup/` and are copied to `/mnt/nas_datasets/<user>/agilex/` on gpu-a:
 
 ```bash
-cd /mnt/data/agilex
-export HF_HOME=/mnt/data/agilex/.hf
+cd /mnt/nas_datasets/<user>/agilex
+export HF_HOME=/mnt/nas_datasets/<user>/agilex/.hf
 export HF_HUB_OFFLINE=1
-export XDG_CACHE_HOME=/mnt/data/agilex/.cache
+export XDG_CACHE_HOME=/mnt/nas_datasets/<user>/agilex/.cache
 export CUDA_VISIBLE_DEVICES=1
 ./venv/bin/python final_validation.py     # loads 020000, prints §5/§6 tables
 ./venv/bin/python loss_trend.py           # 4-checkpoint loss comparison (§4)

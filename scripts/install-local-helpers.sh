@@ -4,7 +4,7 @@
 #
 # WHY: agilex-proxy.sh is used as an SSH ProxyCommand. That is fine when *you*
 # run ssh from a terminal, but a launchd LaunchAgent (the standing NoMachine
-# tunnel, com.azuma.agilex-nx-tunnel) cannot execute anything under
+# tunnel, com.example.agilex-nx-tunnel) cannot execute anything under
 # ~/Documents - macOS TCC refuses it with "Operation not permitted", and the
 # tunnel then dies with "Connection closed by UNKNOWN port 65535".
 #

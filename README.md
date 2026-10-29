@@ -340,3 +340,88 @@ Worth knowing, because the drivers installed do **not** match the hardware prese
 ## Licence
 
 MIT — see `LICENSE`.
+
+---
+
+## Operating modes
+
+Each arm can be driven six ways. The default is joint-space position; the rest
+exist because position control alone cannot do compliant contact, Cartesian arcs,
+hand-guided demos, or arm-to-arm mirroring.
+
+| Mode | SDK call | What it is for |
+|---|---|---|
+| `pos_j` MOVE J *(default)* | `MotionCtrl_2(move_mode=0x01)` + `JointCtrl` | Joint-space position. The action space a policy emits. |
+| `pos_p` MOVE P | `MotionCtrl_2(move_mode=0x00)` + `JointCtrl` **on change only** | Arm plans its own path to a point. |
+| `mit` MIT impedance | `MotionCtrl_2(is_mit_mode=0xAD)` + `JointMitCtrl` | Compliance: per-motor `kp` / `kd` / `t_ref`. Needed for anything that touches. |
+| `movec` MOVE C | `move_mode=0x03` + `EndPoseCtrl` + `MoveCAxisUpdateCtrl` | Cartesian arc through start → via → end. |
+| Trajectory stream | targets fed from a list at `dt` | Replay a recorded / downloaded joint trajectory. |
+| Drag teach | `MotionCtrl_1(grag_teach_ctrl=0x01/0x02/0x03)` | Record by hand, then replay. |
+| Master/slave | `MasterSlaveConfig(0xFA leader / 0xFC follower)` | Left arm hand-guided, right arm mirrors it. |
+
+API: `POST /api/arm/mode`, `/api/arm/mit`, `/api/arm/movec`, `/api/traj/load|play|pause|stop`,
+`/api/teach`, `/api/master-slave`. All take `{"arm": 0|1, ...}`.
+
+Two things are **verified against the hardware, not assumed**:
+
+* `set_mode` reads `GetArmStatus()` back and refuses to pretend. If the arm did not
+  change mode, the server reverts its own bookkeeping and returns failure. This
+  exists because a mode switch silently failing is what made an arm shake on
+  2026-10-29 — see `docs/incident-2026-10-29-shaking.md`.
+* An arm whose CAN bus is silent is marked **not connected** at startup, and no
+  target or home pose is adopted. Otherwise a dead bus reads as `[0,0,0,0,0,0]`
+  and that becomes the "home" pose.
+
+## Finding the robot
+
+The robot is on DHCP, so its address changes. `ssh agilex` keeps working because
+`~/.ssh/config` points `ProxyCommand` at `scripts/agilex-proxy.sh`, which tries,
+in order, first hit wins:
+
+1. **Cache** `~/.cache/agilex/current-ip`, validated by SSH banner *and* host key
+   (an old address can be handed to a different machine).
+2. **ntfy** — the robot publishes its own IP on boot and every 5 minutes
+   (`scripts/agilex-report-ip.sh` + `.timer`). The client polls
+   `https://ntfy.sh/<topic>/json?poll=1` and takes the last `message`. No scanning,
+   instant, survives any address change. The Android app uses the same channel.
+3. **Previously seen** addresses (`~/.cache/agilex/seen-ips`, last 20).
+4. **mDNS** `agilex.local`.
+5. **Sequential sweep**, known /24s first, 600 s budget, one sweep at a time,
+   every candidate validated by SSH banner + host key. **Set your own subnet:**
+   `export AGILEX_SCAN_RANGE=10.0.0.0/16` — the shipped default is a placeholder.
+
+Set the topic once: `echo '<your-topic>' > ~/.config/agilex/ntfy-topic`.
+
+## Install
+
+```bash
+# from a laptop, over SSH (stages, installs, starts, verifies)
+./install.sh agilex@agilex.local
+
+# or on the robot itself
+sudo ./install.sh
+```
+
+Then open `http://<robot-ip>:8765/`. The web UI password comes from
+`/etc/agilex-remote.env` (`AGILEX_PASSWORD=...`, mode 0600). **The default is
+`changeme` — change it.**
+
+## Configuration
+
+| Setting | Where | Default |
+|---|---|---|
+| Web UI password | `/etc/agilex-remote.env` → `AGILEX_PASSWORD` | `changeme` |
+| Listen address / port | unit env `AGILEX_REMOTE_HOST`, code `PORT` | `0.0.0.0:8765` |
+| Chassis speed cap | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | 2.3 m/s, 1.2 rad/s |
+| Arm speed | `AGILEX_ARM_SPEED_PCT` | 25 % |
+| Max target lag | `AGILEX_MAX_TARGET_LAG` | 15° |
+| Resync tolerance | `AGILEX_RESYNC_MARGIN` | 5° |
+| ntfy topic | `~/.config/agilex/ntfy-topic` | none |
+
+## Tests
+
+```bash
+python3 tools/test-modes-offline.py     # 46 assertions, fake CAN, no hardware
+./scripts/verify-modes.sh               # 12 checks on the robot, no motion
+./scripts/mode-smoke.sh                 # 23 checks on the robot, no motion
+```

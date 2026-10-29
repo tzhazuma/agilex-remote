@@ -1,8 +1,8 @@
 # π0 / π0-FAST / OpenVLA on AgileX Piper — bounded feasibility check
 
 **Date:** 2026-10-22 (Asia/Shanghai)
-**Host inspected:** `5090a` (GPU_HOST) over SSH
-**Venv inspected:** `/mnt/data/agilex/venv` — LeRobot **0.4.4**, torch **2.10.0+cu128**, Python **3.10.21**
+**Host inspected:** `gpu-a` (<gpu-host>) via `./ssh5090.sh a`
+**Venv inspected:** `/mnt/nas_datasets/<user>/agilex/venv` — LeRobot **0.4.4**, torch **2.10.0+cu128**, Python **3.10.21**
 **Budget:** read/inspect only + one small isolated install (transformers into a `--target` dir, never into the shared venv) + one VRAM probe on GPU 3. Nothing was written into the venv, the ACT job's environment, or GPU 0.
 
 **Verdict up front: π0/π0-FAST is *not* a drop-in for a 14-dim dual Piper arm, and OpenVLA is a worse fit than π0. 32 GB of VRAM is not the blocker — software packaging, checkpoint format, and action-space semantics are.**
@@ -12,7 +12,7 @@
 ## 0. Environment facts measured at the time of the check
 
 ```
-nvidia-smi (5090a):
+nvidia-smi (gpu-a):
   0, 21664 MiB used / 32607 MiB   <- ACT job (pid 959219; same pid also holds GPU 2 and 3)
   1, 30337 MiB used / 32607 MiB   <- leftover openpi serve_policy.py (pid 1682255, etime 33d)
   2, 23872 MiB used / 32607 MiB   <- ACT job
@@ -32,7 +32,7 @@ Two facts worth carrying forward:
 
 ### 1.1 Code path (read from the installed wheel)
 
-`/mnt/data/agilex/venv/lib/python3.10/site-packages/lerobot/policies/`
+`/mnt/nas_datasets/<user>/agilex/venv/lib/python3.10/site-packages/lerobot/policies/`
 
 | file | what it is |
 |---|---|
@@ -101,10 +101,10 @@ Community LeRobot-format π0-FAST fine-tunes also exist for other robots (`iantc
 **Answer to "is there a Piper-compatible pretrained checkpoint in LeRobot format?": No.** The only Piper π0-FAST checkpoints are the two Orbax/JAX ones, and their file trees confirm it:
 
 ```
-MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2 : 245 files, 42.58 GB
+Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2 : 245 files, 42.58 GB
   checkpoints/ppv4ppv5_run1/500/params/ocdbt.process_0/d/<hash>      <- Orbax params
   checkpoints/ppv4ppv5_run1/500/train_state/ocdbt.process_0/d/<hash> <- Orbax optimizer state
-MODEL_AUTHOR/piper-pi0fast-multistage : 69 files, 8.56 GB, same layout
+Kavin60606/piper-pi0fast-multistage : 69 files, 8.56 GB, same layout
 ```
 
 The `params/ocdbt...` + `train_state/` layout is Orbax/JAX. (Also note 42.58 GB is mostly duplicated optimizer state — the inference-only payload is far smaller.)
@@ -123,7 +123,7 @@ weights resident    7.01 GB   (bf16)   <- identical to lerobot/pi0_libero_finetu
 then: RuntimeError in unpatched eager attention (see 1.2b) -> peak-activation number NOT obtained
 ```
 
-Probe script kept at `/mnt/data/agilex/pi0_vram_probe.py` (plus a dtype-consistent copy of the model at `.../probe/pi0_modeling_patched.py`, and `transformers==4.57.1` + `tokenizers==0.22.1` installed **only** into `/mnt/data/agilex/piextra` via `uv pip install --target`, never into the venv).
+Probe script kept at `/mnt/nas_datasets/<user>/agilex/pi0_vram_probe.py` (plus a dtype-consistent copy of the model at `.../probe/pi0_modeling_patched.py`, and `transformers==4.57.1` + `tokenizers==0.22.1` installed **only** into `/mnt/nas_datasets/<user>/agilex/piextra` via `uv pip install --target`, never into the venv).
 
 **Numbers for the answer (weights measured, activations bounded analytically and marked as estimates):**
 
@@ -177,7 +177,7 @@ What a pure wrapper can and cannot do:
 
 ## 5. Recommendation
 
-**Stay with (a) — keep fine-tuning ACT on your own data, and do not invest in π0/π0-FAST or OpenVLA right now.** The blockers are not VRAM (7 GB bf16 weights measured for π0; ~16–18 GB for OpenVLA, both fine on 32 GB) — they are: no LeRobot-format Piper checkpoint exists at all (the only two Piper checkpoints are 42.6 GB / 8.6 GB Orbax dumps requiring a converter that isn't shipped in the wheel), LeRobot 0.4.4's π0 port refuses to run without its *patched transformers fork* (stock `transformers` fails both the version guard and the 2-D attention mask — I reproduced both failures), the PaliGemma tokenizer is gated (403 without a token), and the checkpoint's 7-dim right-arm-radians space has no information path to your 14-dim dual-arm-degrees action space, so the left arm and all bimanual coordination would still have to be learned from new data. If you want a π0-class result soon, the cheap experiment is to let the *other* agent's openpi install serve `MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2` natively on GPU 1 (openpi reads Orbax directly — an openpi π0 server is literally already running on that box) and drive **only the right arm** from it while scripting the left; that gets you a real π0 policy on your hardware for the cost of an install that is already happening. If what you actually want is a *14-dim pretrained* starting point in LeRobot format, the only dimension match I found on hf-mirror is `LBST/t16_pick_and_place_agilex_smolvla_18k` — SmolVLA, **450 M params, 0.91 GB**, `observation.state [14]` → `action [14]`, 3 cameras at 256², trained on an AgileX 14-dim dataset — which is 8× smaller than π0-FAST and fits your action space exactly (verify the camera names and that it is the same Piper platform before trusting it). Chasing OpenVLA is strictly worse than π0 here: 15 GB download, 7-dim single-arm end-effector deltas, same gated-tokenizer class of problem, and no LoRA-scale fine-tune path documented for a 14-dim rig.
+**Stay with (a) — keep fine-tuning ACT on your own data, and do not invest in π0/π0-FAST or OpenVLA right now.** The blockers are not VRAM (7 GB bf16 weights measured for π0; ~16–18 GB for OpenVLA, both fine on 32 GB) — they are: no LeRobot-format Piper checkpoint exists at all (the only two Piper checkpoints are 42.6 GB / 8.6 GB Orbax dumps requiring a converter that isn't shipped in the wheel), LeRobot 0.4.4's π0 port refuses to run without its *patched transformers fork* (stock `transformers` fails both the version guard and the 2-D attention mask — I reproduced both failures), the PaliGemma tokenizer is gated (403 without a token), and the checkpoint's 7-dim right-arm-radians space has no information path to your 14-dim dual-arm-degrees action space, so the left arm and all bimanual coordination would still have to be learned from new data. If you want a π0-class result soon, the cheap experiment is to let the *other* agent's openpi install serve `Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2` natively on GPU 1 (openpi reads Orbax directly — an openpi π0 server is literally already running on that box) and drive **only the right arm** from it while scripting the left; that gets you a real π0 policy on your hardware for the cost of an install that is already happening. If what you actually want is a *14-dim pretrained* starting point in LeRobot format, the only dimension match I found on hf-mirror is `LBST/t16_pick_and_place_agilex_smolvla_18k` — SmolVLA, **450 M params, 0.91 GB**, `observation.state [14]` → `action [14]`, 3 cameras at 256², trained on an AgileX 14-dim dataset — which is 8× smaller than π0-FAST and fits your action space exactly (verify the camera names and that it is the same Piper platform before trusting it). Chasing OpenVLA is strictly worse than π0 here: 15 GB download, 7-dim single-arm end-effector deltas, same gated-tokenizer class of problem, and no LoRA-scale fine-tune path documented for a 14-dim rig.
 
 ---
 
@@ -193,6 +193,6 @@ What a pure wrapper can and cannot do:
 | openpi being able to serve the Piper Orbax checkpoint | **Not verified by me** — that is the other agent's task. Corroborating evidence: an openpi `serve_policy.py` π0 process has been resident on GPU 1 for 33 days. |
 
 **Artifacts left on the NAS (nothing in the shared venv):**
-`/mnt/data/agilex/pi0_vram_probe.py`,
-`/mnt/data/agilex/probe/pi0_modeling_patched.py`,
-`/mnt/data/agilex/piextra/` (transformers 4.57.1 + tokenizers 0.22.1, `--target` install, plus a one-line SigLIP `check.py` stub used only for the probe).
+`/mnt/nas_datasets/<user>/agilex/pi0_vram_probe.py`,
+`/mnt/nas_datasets/<user>/agilex/probe/pi0_modeling_patched.py`,
+`/mnt/nas_datasets/<user>/agilex/piextra/` (transformers 4.57.1 + tokenizers 0.22.1, `--target` install, plus a one-line SigLIP `check.py` stub used only for the probe).

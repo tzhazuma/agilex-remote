@@ -2,7 +2,7 @@
 # agilex-proxy.sh — SSH ProxyCommand that finds the robot and connects to it.
 #
 # WHY: the robot is on eduroam Wi-Fi with DHCP, so its IP changes on every
-# reboot (observed ROBOT_IP -> ROBOT_IP). Rather than hardcoding an
+# reboot (observed <ip-a> -> <ip-b>). Rather than hardcoding an
 # address, this script discovers the current one and hands the socket to ssh,
 # so plain `ssh agilex` keeps working forever.
 #
@@ -45,9 +45,9 @@ else
 fi
 mkdir -p "$STATE" 2>/dev/null
 
-# Sweep range. The robot has lived in ROBOT_IPx and ROBOT_IPx, so default to
+# Sweep range. The robot has lived in two different /24s, so default to
 # the surrounding /20 and let it be overridden.
-SCAN_RANGE="${AGILEX_SCAN_RANGE:-ROBOT_IP/20}"
+SCAN_RANGE="${AGILEX_SCAN_RANGE:-192.168.1.0/24}"
 SCAN_BUDGET="${AGILEX_SCAN_BUDGET:-600}"     # seconds before giving up (~245s per /24)
 
 log() { printf '%s\n' "$*" >&2; }
@@ -104,7 +104,7 @@ acquire_sweep_lock() {
 # ALL key types, not just ed25519. known_hosts can hold an rsa entry from an
 # earlier connection alongside the ed25519 one; filtering to ed25519 alone made
 # this return the wrong key (or nothing), and the sweep then rejected the real
-# robot - it found ROBOT_IP, decided it "is not the robot", and scanned the
+# robot - it found <robot-ip>, decided it "is not the robot", and scanned the
 # entire /20 before giving up, while plain `ssh agilex` worked the whole time.
 expected_key() {
   ssh-keygen -F "${AGILEX_KEY_ALIAS:-agilex-robot}" 2>/dev/null \
@@ -229,7 +229,7 @@ acquire_sweep_lock
 
 log "agilex: cached/mDNS lookup failed - sweeping $(echo $NETS | wc -w | tr -d ' ') subnet(s), up to ${SCAN_BUDGET}s ..."
 log "agilex: order: $NETS"
-log "agilex: tip - ask campus IT for a DHCP reservation on MAC ROBOT_MAC to avoid this."
+log "agilex: tip - ask campus IT for a DHCP reservation on MAC ac:e0:10:51:69:06 to avoid this."
 
 deadline=$(( $(date +%s) + SCAN_BUDGET ))
 

@@ -1,6 +1,6 @@
-# openpi (JAX) install on 5090a + Piper π0-FAST checkpoint load
+# openpi (JAX) install on gpu-a + Piper π0-FAST checkpoint load
 
-**Host:** `5090a` = GPU_HOST (4× RTX 5090 32 GB, driver 570.211.01, compute capability **12.0 = sm_120**)
+**Host:** `gpu-a` = <gpu-host> (4× RTX 5090 32 GB, driver 570.211.01, compute capability **12.0 = sm_120**)
 **Date:** 2026-10-22 01:20–01:56 CST
 **Verdict:** ✅ **JAX runs native sm_120 kernels** · ✅ **Piper checkpoint restores and loads into a stock openpi `pi0_fast` architecture** (better than the predicted "config missing" outcome)
 
@@ -16,7 +16,7 @@
 | State / action dims | **state = 7**, **actions = 7** (`[j1..j6 rad, gripper 0..1]`), action chunk 10 @ 20 Hz |
 | What's still missing for inference | No `piper*` config exists in openpi (`grep -c piper config.py` = **0**): the data/policy config (input keys, prompt, `asset_id="piper_ppv4ppv5"`) and the FAST/PaliGemma tokenizer assets must be authored/fetched |
 
-Everything lives on the NAS; **nothing was installed on `/`** (still 98 %, 18 GB free) and the existing `/mnt/data/agilex/venv` was never touched.
+Everything lives on the NAS; **nothing was installed on `/`** (still 98 %, 18 GB free) and the existing `/mnt/nas_datasets/<user>/agilex/venv` was never touched.
 
 ---
 
@@ -25,45 +25,45 @@ Everything lives on the NAS; **nothing was installed on `/`** (still 98 %, 18 GB
 ### 2.1 Clone (HTTPS worked — SSH-over-443 fallback never needed)
 
 ```bash
-mkdir -p /mnt/data/agilex
-cd /mnt/data/agilex
+mkdir -p /mnt/nas_datasets/<user>/agilex
+cd /mnt/nas_datasets/<user>/agilex
 git clone https://github.com/Physical-Intelligence/openpi.git openpi      # worked, no hang
 git -C openpi submodule update --init --recursive                         # aloha + LIBERO, also over HTTPS
 ```
 
-> **Necessary fix:** the NAS squashes ownership (files show `uid 1024 users`, we are `uid 1014`), so git refused to operate on uv's *own* git cache with
+> **Necessary fix:** the NAS squashes ownership (files show `uid 1024 users`, we are `uid 1014(<user>)`), so git refused to operate on uv's *own* git cache with
 > `fatal: detected dubious ownership in repository at '…/.uvcache/git-v1/db/…'`.
-> Fixed with `git config --global --add safe.directory "*"` (only affects that user).
+> Fixed with `git config --global --add safe.directory "*"` (only affects user `<user>`).
 > Symptom if not fixed: `uv sync` fails with `cause: Git operation failed`.
 
 ### 2.2 Environment (mirrors + caches on NAS)
 
-`/mnt/data/agilex/openpi-logs/env.sh`:
+`/mnt/nas_datasets/<user>/agilex/openpi-logs/env.sh`:
 
 ```bash
-export UV_CACHE_DIR=/mnt/data/agilex/.uvcache
-export HF_HOME=/mnt/data/agilex/.hf
-export XDG_CACHE_HOME=/mnt/data/agilex/.cache
-export PIP_CACHE_DIR=/mnt/data/agilex/.pipcache
+export UV_CACHE_DIR=/mnt/nas_datasets/<user>/agilex/.uvcache
+export HF_HOME=/mnt/nas_datasets/<user>/agilex/.hf
+export XDG_CACHE_HOME=/mnt/nas_datasets/<user>/agilex/.cache
+export PIP_CACHE_DIR=/mnt/nas_datasets/<user>/agilex/.pipcache
 export HF_ENDPOINT=https://hf-mirror.com
 export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 export UV_HTTP_TIMEOUT=180
 export GIT_LFS_SKIP_SMUDGE=1
-export OPENPI_DATA_HOME=/mnt/data/agilex/.openpi
+export OPENPI_DATA_HOME=/mnt/nas_datasets/<user>/agilex/.openpi
 ```
 
 ### 2.3 Install (openpi's documented `uv` flow, run detached)
 
 ```bash
-source /mnt/data/agilex/openpi-logs/env.sh
-cd /mnt/data/agilex/openpi
+source /mnt/nas_datasets/<user>/agilex/openpi-logs/env.sh
+cd /mnt/nas_datasets/<user>/agilex/openpi
 uv python install 3.11          # repo pins .python-version = 3.11
 uv sync                         # creates .venv, pulls lerobot + dlimp from git
 uv pip install -e .
 ```
 
-Log: `/mnt/data/agilex/openpi-logs/sync3.log` → `=== EDIT_EXIT=0 ===`, `.venv` = **7.7 GB**, Python 3.11.16.
+Log: `/mnt/nas_datasets/<user>/agilex/openpi-logs/sync3.log` → `=== EDIT_EXIT=0 ===`, `.venv` = **7.7 GB**, Python 3.11.16.
 `uv sync` took ~13 min wall (≈1 min of that was self-inflicted: a leftover `uv pip install` from a first attempt held the venv lock — see §6).
 
 ### 2.4 Installed versions (as locked by openpi)
@@ -79,8 +79,8 @@ flax 0.10.2 · orbax-checkpoint 0.11.13 · torch 2.7.1 · transformers 4.53.2 ·
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
-uvx --from huggingface_hub hf download MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2 \
-    --local-dir /mnt/data/agilex/models/MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2
+uvx --from huggingface_hub hf download Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2 \
+    --local-dir /mnt/nas_datasets/<user>/agilex/models/Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2
 ```
 
 **Size reality check:** the repo is much bigger than the 2–4 GB expected — it ships **four** Orbax checkpoints (`1000`, `1500`, `2000`, `2500`), each ≈8 GB (`params/` 5.2 GB + `train_state/` 2.8 GB) → **~31 GB total** on disk. `huggingface.co` is DNS-blocked; the mirror served everything without auth.
@@ -89,7 +89,7 @@ uvx --from huggingface_hub hf download MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-
 
 ## 3. JAX on sm_120 — proof, not just `jax.devices()`
 
-Probe (`/mnt/data/agilex/openpi-logs/jax_probe.py`), run as
+Probe (`/mnt/nas_datasets/<user>/agilex/openpi-logs/jax_probe.py`), run as
 `CUDA_VISIBLE_DEVICES=3 .venv/bin/python jax_probe.py`:
 
 ```
@@ -113,7 +113,7 @@ grep -rh "target sm_120a" /tmp/xd | sort -u
 ```
 
 → XLA emitted PTX/code for **`sm_120a`** (Blackwell). Copy kept at
-`/mnt/data/agilex/openpi-logs/evidence/module_0005.jit_matmul.ptx`.
+`/mnt/nas_datasets/<user>/agilex/openpi-logs/evidence/module_0005.jit_matmul.ptx`.
 
 So: **no blocker.** openpi's pinned `jax[cuda12]==0.5.3` resolves to the CUDA **12.9** nvcc/runtime wheels, which is exactly what Blackwell needs; the driver JIT/compiles for sm_120 and the kernels execute. No newer JAX build was required, and no fallback path was needed.
 
@@ -210,7 +210,7 @@ Action means ≈0 with small std ⇒ these are **delta joint actions** (not abso
    | 2 | 23.9 / **8.2 GB** | `llama-server` (23.9 GB) |
    | 3 | 20.3 / **11.8 GB** | `llama-server` (20.3 GB) |
 
-   The task brief said "a training job is using GPU 0, use GPU 1/2/3" — that was **not** accurate: **no `lerobot-train` process exists** on the box, GPU 1 holds a long-running pi0-LIBERO *policy server* and has only 2.6 GB free, and GPUs 0/2/3 run `llama-server`. I used **GPU 3** (most free) throughout. *(Separately: `/mnt/data/agilex/train-act.log` ends at 01:17:23 with `huggingface_hub.errors.OfflineModeIsEnabled: Cannot reach https://huggingface.co/api/repos/create: offline mode is enabled` — i.e. the ACT job appears to have already died on an HF offline-mode error before I started. I did not touch it or its venv.)*
+   The task brief said "a training job is using GPU 0, use GPU 1/2/3" — that was **not** accurate: **no `lerobot-train` process exists** on the box, GPU 1 holds a long-running pi0-LIBERO *policy server* and has only 2.6 GB free, and GPUs 0/2/3 run `llama-server`. I used **GPU 3** (most free) throughout. *(Separately: `/mnt/nas_datasets/<user>/agilex/train-act.log` ends at 01:17:23 with `huggingface_hub.errors.OfflineModeIsEnabled: Cannot reach https://huggingface.co/api/repos/create: offline mode is enabled` — i.e. the ACT job appears to have already died on an HF offline-mode error before I started. I did not touch it or its venv.)*
 
 2. **Model build OOM on GPU 3** (first attempt, fp32, JAX preallocating 75 % of a 32 GB card that only had 11.8 GB free):
    ```
@@ -240,11 +240,11 @@ Action means ≈0 with small std ⇒ these are **delta joint actions** (not abso
 
 ## 7. Artifacts
 
-| Path (on 5090a) | What |
+| Path (on gpu-a) | What |
 |---|---|
-| `/mnt/data/agilex/openpi` | openpi checkout + `.venv` (Python 3.11.16, 7.7 GB) |
-| `/mnt/data/agilex/openpi-logs/env.sh` | env with mirrors + NAS caches |
+| `/mnt/nas_datasets/<user>/agilex/openpi` | openpi checkout + `.venv` (Python 3.11.16, 7.7 GB) |
+| `/mnt/nas_datasets/<user>/agilex/openpi-logs/env.sh` | env with mirrors + NAS caches |
 | `…/openpi-logs/sync3.log`, `dl.log` | install + download logs |
 | `…/openpi-logs/jax_probe.py`, `restore.py`, `restore2.py`, `gpu_fwd.py` | probe / restore / forward scripts |
 | `…/openpi-logs/evidence/module_0005.jit_matmul.ptx` | XLA PTX, `.target sm_120a` |
-| `/mnt/data/agilex/models/MODEL_AUTHOR/pi0-fast-piper-h-plate-pick-ft-v2` | checkpoint (31 GB, steps 1000/1500/2000/2500) |
+| `/mnt/nas_datasets/<user>/agilex/models/Kavin60606/pi0-fast-piper-h-plate-pick-ft-v2` | checkpoint (31 GB, steps 1000/1500/2000/2500) |
