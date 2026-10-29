@@ -9,6 +9,11 @@ This is the code that came out of setting one specific robot up. It is published
 because the non-obvious parts (below) took real debugging to find, and they apply
 to any AgileX + Piper build.
 
+> **拿到这个包，先看 [`INSTALL-CONNECT.md`](INSTALL-CONNECT.md)** — 安装、连接、自检、常见问题，
+> 大约 10 分钟能让网页遥控器跑起来。
+> Just want it running? Start with **[`INSTALL-CONNECT.md`](INSTALL-CONNECT.md)** (install + connect guide).
+> One-command check afterwards: `./scripts/check-connection.sh`.
+
 ---
 
 ## What it does

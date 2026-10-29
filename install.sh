@@ -88,6 +88,8 @@ UNIT_EOF
 
   IP="$(hostname -I | awk '{print $1}')"
   say "done"
+  echo "  guide:   $HERE/INSTALL-CONNECT.md  (install / connect / troubleshooting)"
+  echo "  check:   ./scripts/check-connection.sh"
   echo "  UI:      http://$IP:$PORT/"
   echo "  status:  curl -s http://127.0.0.1:$PORT/api/status | head -c 400"
   echo "  logs:    journalctl -u agilex-remote -f"
@@ -123,6 +125,7 @@ trap 'kill $TUNNEL 2>/dev/null || true' EXIT
 sleep 2
 if curl -fsS --max-time 6 "http://127.0.0.1:$PORT/api/status" >/dev/null; then
   echo "  OK - open http://127.0.0.1:$PORT/"
+  echo "  guide: $HERE/INSTALL-CONNECT.md"
 else
   echo "  could not reach the API through the tunnel; check: journalctl -u agilex-remote"
 fi
