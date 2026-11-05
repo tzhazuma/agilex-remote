@@ -195,6 +195,11 @@ STATUS_TOPIC = os.environ.get("AGILEX_STATUS_TOPIC", "/tracer_status")
 
 VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}   # 0 = faces the ARM, 2 = faces the FLOOR
 VIDEO_W, VIDEO_H, VIDEO_FPS = 640, 480, 12
+# The rate we ask the CAMERA for. Must be requested at the input (-framerate),
+# not only on the output: otherwise the device negotiates its maximum mode and
+# reserves isochronous USB bandwidth for that, and two cameras on one USB 2.0
+# controller can exceed the budget - the second then starves and /frame 503s.
+VIDEO_IN_FPS = int(os.environ.get("AGILEX_CAM_FPS", "12"))
 
 # Documented Piper joint limits, degrees (from piper_sdk JointCtrl docstring)
 JOINT_LIMITS_DEG = [
@@ -793,6 +798,24 @@ class ArmBridge:
                     if all(self.joints_enabled):
                         break
                     log(f"arm enable attempt {attempt + 1}: {self.joints_enabled}")
+
+                # VERIFY THE MODE TOOK. Enabling re-asserts the mode, but a
+                # MotionCtrl_2 frame can be ignored - and streaming position
+                # targets into an arm that is still in MOVE_P makes it fight its
+                # own planner. That is exactly the 2026-10-29 shaking incident,
+                # so check what the ARM says rather than trusting the bookkeeping.
+                expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
+                          "movec": "MOVE_C", "mit": "MOVE_J"}.get(self.mode, "MOVE_J")
+                actual = self._read_actual_mode()
+                if actual is not None and actual != expect:
+                    self._apply_mode()
+                    time.sleep(0.35)
+                    actual = self._read_actual_mode()
+                self.mode_actual = actual
+                self.mode_verified = actual is None or actual == expect
+                if not self.mode_verified:
+                    log(f"arm {self.side} enabled but arm reports {actual}, "
+                        f"expected {expect} - re-asserted the mode; verify before use")
             else:
                 # Stop the control loop FIRST. It re-asserts MotionCtrl_2 every
                 # 2 s whenever self.enabled is true, so leaving that set meant the
@@ -1280,7 +1303,12 @@ def ffmpeg_cmd(dev):
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "v4l2", "-input_format", "mjpeg",
-        "-video_size", f"{VIDEO_W}x{VIDEO_H}", "-i", dev,
+        "-video_size", f"{VIDEO_W}x{VIDEO_H}",
+        # Ask the DEVICE for the low rate, not just the output. Without this the
+        # camera runs its maximum mode (30 fps) and reserves USB bandwidth for
+        # it; two of those on the same 480 Mbps controller starve each other.
+        "-framerate", str(VIDEO_IN_FPS),
+        "-i", dev,
         "-f", "mjpeg", "-q:v", "6", "-r", str(VIDEO_FPS), "-",
     ]
 
@@ -1370,11 +1398,16 @@ class MjpegSource:
 
     def frames(self):
         buf = b""
+        first = True
         while not self._stop.is_set():
+            # A cold Orbbec can take 10-20 s to emit its first JPEG after a
+            # reboot, so the FIRST wait gets the long budget. After a frame has
+            # arrived, 8 s of silence really does mean a stall.
+            budget = FIRST_FRAME_TIMEOUT_S if first else FRAME_TIMEOUT_S
             try:
-                chunk = self._q.get(timeout=FRAME_TIMEOUT_S)
+                chunk = self._q.get(timeout=budget)
             except queue.Empty:
-                log(f"video {self.dev}: no data for {FRAME_TIMEOUT_S}s - giving up")
+                log(f"video {self.dev}: no data for {budget}s - giving up")
                 return
             if chunk is None:
                 return
@@ -1389,6 +1422,7 @@ class MjpegSource:
                     buf = buf[s:]
                     break
                 yield buf[s:e + 2]
+                first = False
                 buf = buf[e + 2:]
 
     def close(self):
@@ -2049,7 +2083,13 @@ class Handler(BaseHTTPRequestHandler):
                         del self.server.frame_held[c]
                         log(f"/frame: released camera {c} after {FRAME_HOLD_S}s idle")
 
-            last_frame = hub.wait(None, timeout=FRAME_TIMEOUT_S)
+            # Same reasoning as the pump: the first request after a cold start
+            # must wait long enough for the camera to wake up, or the client gets
+            # a 503 that looks like a broken camera.
+            cold = hub.snapshot() is None
+            last_frame = hub.wait(
+                None,
+                timeout=FIRST_FRAME_TIMEOUT_S if cold else FRAME_TIMEOUT_S)
             jpg = last_frame if isinstance(last_frame, (bytes, bytearray)) else hub.snapshot()
             if jpg is None:
                 self._json({"ok": False, "error": f"camera {cam} has no frame yet"}, 503)

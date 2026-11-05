@@ -83,7 +83,9 @@ for a in d.get("arms", []):
             f"mode={mode} arm_says={actual} cmd={hz} Hz")
     if not conn:
         fails += 1
-    if conn and actual not in (None, "MOVE_J") and mode == "pos_j":
+    # Only meaningful while the arm is enabled: a disabled arm just sits in
+    # whatever mode it booted into, and nothing is being streamed at it.
+    if en and conn and actual not in (None, "MOVE_J") and mode == "pos_j":
         print(f"  \033[33mWARN\033[0m {side}: software thinks pos_j but the arm reports {actual}")
     if conn and isinstance(hz, (int, float)) and hz < 30:
         print(f"  \033[33mWARN\033[0m {side}: command rate {hz} Hz is low (expected ~50)")

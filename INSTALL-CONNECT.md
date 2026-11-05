@@ -211,6 +211,8 @@ curl -X POST :8765/api/traj/play      -d '{"arm":0,"loop":false,"speed":0.5}'
 | 手臂不动，`enabled: true` | 模式不是 MOVE_J，或电机未全部使能 | 看 `mode_actual` 和 `joints_enabled` |
 | 手臂抖 / 嗡嗡响 | 目标与实测差太多（被限位或卡住） | `POST /api/arm/reset` 重新对齐，**不会产生位移** |
 | 相机打不开 | 设备被别的进程占用（V4L2 独占） | `fuser -v /dev/video0`，停掉抢占的进程 |
+| 只有一个相机出图，另一个 503 | **两台相机在同一个 USB 2.0 控制器上，等时带宽不够**：不限制输入帧率时相机会按最大模式（30 fps）预留带宽，两个加起来就超了 | 服务已默认用 `-framerate 12` 向设备要低帧率；还不够就 `AGILEX_CAM_FPS=10` 再降 |
+| 开机后第一次取图超时 | 冷启动 | 首帧超时是 20 s（`AGILEX_FIRST_FRAME_TIMEOUT`），第二次起 8 s |
 | 服务起不来 | ROS 环境没 source | `journalctl -u agilex-remote -n 50` |
 
 **总线静默**怎么确认：
