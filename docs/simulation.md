@@ -454,3 +454,64 @@ Every approach height in this plan stays at or below 0.13 m for that reason. A
 top-down planner that assumes a vertical tool at 0.3 m fails IK outright — this
 is the same limitation the first simulation run hit, and it is a property of the
 arm, not of the simulator.
+
+---
+
+## Replaying real recorded episodes (`tools/sim_replay.py`)
+
+Feeding a recorded `timeline.csv` into the model answers questions a static
+inspection cannot: are the recorded poses inside the joint limits, does the arm
+pass through itself, does the tool go below its base plane.
+
+### Convention check comes first
+
+The SDK reports degrees and the URDF has its own joint zero. If they differ, the
+replay looks plausible and every conclusion is wrong. `--probe` prints the
+resulting tool position, and with the tool pointing down the TCP lands at
+z = 0.08–0.13 m above the base — i.e. the conventions agree and **no offset is
+needed**. That check takes one second and is the difference between a real
+result and a confident wrong one.
+
+### Result on four episodes
+
+| episode | frames | joint-limit violations | self-collision | floor penetration |
+|---|---|---|---|---|
+| demo episode_0010 | 100 | 0 | 0 | 0 |
+| demo episode_0011 | 83 | 0 | 0 | 0 |
+| demo episode_0012 | 84 | 0 | 0 | 0 |
+| robot episode_0042 | 170 | 0 | 0 | 0 |
+
+All clean. Getting to that answer required removing three false positives, which
+is the actual content of this work:
+
+1. **The gripper jaws are not a self-collision.** Forcing the fingers closed made
+   `link7 <-> link8` register as a contact on every single frame. The fix was to
+   replay the *recorded* `L_grip` value instead of a fixed one — the CSV already
+   had it.
+2. **Adjacent links always touch at their shared joint.** The MJCF has no
+   `<contact><exclude>` entries, so parent/child body pairs report contacts
+   constantly. Those are ignored by body-tree adjacency.
+3. **A contact at `dist ≈ 0` is a graze.** With coarse collision geometry several
+   poses touch without penetrating. Only penetration deeper than 1 mm counts.
+
+And one tolerance that is a real property of the robot rather than a fudge: the
+arms rest up to ~0.4° outside their datasheet limits at the elbow, so a 0.5°
+tolerance is used before calling a pose illegal. Without it, every episode
+"fails" on a fraction of a degree.
+
+### The uncomfortable finding
+
+Every episode replayed is **nearly static**. `episode_0042` is 170 frames of one
+unchanged pose (joint range min == max in every column), and the three demo
+captures move about 0.4 rad in total. So "the replay is clean" also means "these
+recordings contain very little motion to collide with" — consistent with the
+earlier finding that most of the scripted episodes were degenerate. A clean
+replay is not evidence that the demonstrations are good.
+
+Usage:
+
+```bash
+.venv-sim/bin/python tools/sim_replay.py --probe <episode_dir>   # check convention
+.venv-sim/bin/python tools/sim_replay.py <episode_dir>           # limits + collisions
+.venv-sim/bin/python tools/sim_replay.py --targets <episode_dir> # replay commanded targets
+```
