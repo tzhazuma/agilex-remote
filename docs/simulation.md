@@ -147,7 +147,7 @@ Everything lives under `agilex-setup/`; the venv is `.venv-sim`. System Python
 was never touched. Base interpreter: Homebrew `python3.12` (3.12.16, arm64).
 
 ```bash
-cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
+cd <repo>
 
 /opt/homebrew/bin/python3.12 -m venv .venv-sim
 .venv-sim/bin/python -m pip install --upgrade pip
@@ -266,7 +266,7 @@ Consequences, all of which shaped this demo:
 ## 7. Reproducing
 
 ```bash
-cd <home>/Documents/deepseek-harness/default-workspace/agilex-setup
+cd <repo>
 
 # validate model + IK only (fast, no simulation)
 .venv-sim/bin/python tools/sim_piper.py --check
@@ -403,3 +403,54 @@ cd mujoco_menagerie && git sparse-checkout set agilex_piper
 ffprobe -v error -show_entries stream=width,height,nb_frames,r_frame_rate \
         -of default=noprint_wrappers=1 assets/sim/piper_pick_and_place.mp4
 ```
+
+---
+
+## A second, faster grasp planner (`tools/sim_grasp.py`)
+
+`sim_piper.py` solves IK with `scipy.optimize.least_squares`: 4 waypoints × 25
+random restarts × up to 2000 evaluations. Re-running it now stalls for minutes
+before the first IK line prints, which is why `--check` appeared to hang. The
+model itself was fine — loading takes 0.2 s warm and ~23 s cold, and two
+concurrent loads made it look worse.
+
+`sim_grasp.py` replaces the solver rather than debugging scipy:
+
+| | `sim_piper.py` | `sim_grasp.py` |
+|---|---|---|
+| IK | `least_squares`, 25 random restarts | damped least squares on MuJoCo's **analytic** body Jacobian (`mj_jac`) |
+| Dependencies | scipy | numpy + mujoco only |
+| Determinism | random restarts, seeded but fragile | deterministic, no restarts |
+| IK time | minutes (now) | a few ms per pose |
+| Checks the grasp | yes | yes, plus lift height and landing error |
+
+### Result (real Menagerie `agilex_piper` model, CPU, macOS)
+
+```
+IK above_cube  residual= 0.1 mm  tool_down=-0.79
+IK at_cube     residual= 0.0 mm  tool_down=-0.91
+IK lift        residual= 0.1 mm  tool_down=-0.77
+IK above_pad   residual= 0.1 mm  tool_down=-0.77
+IK at_pad      residual= 0.0 mm  tool_down=-0.90
+trajectory: 221 frames (8.8 s of motion)
+
+cube start: [0.330 -0.100 0.021]
+cube end:   [0.331  0.101 0.028]
+
+cube lifted   :  106.2 mm   (peak z 0.127)
+landed on pad :    1.8 mm from the pad centre
+GRASP SUCCEEDED
+```
+
+Artifacts: `assets/sim/grasp/piper_grasp.mp4`, `piper_grasp.gif`, and 45 stills
+in `assets/sim/grasp/frames/`.
+
+### What constrains the task design
+
+`tool_down` is the world-z component of the tool axis (-1 would be straight
+down). It never gets past about -0.91, because **the Piper's wrist pitch spans
+only ±70°**: the gripper cannot be aimed straight down above roughly 0.17 m.
+Every approach height in this plan stays at or below 0.13 m for that reason. A
+top-down planner that assumes a vertical tool at 0.3 m fails IK outright — this
+is the same limitation the first simulation run hit, and it is a property of the
+arm, not of the simulator.
