@@ -24,18 +24,32 @@ EOF
   exit 2
 fi
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/agilex-lease.sh"
+lease_acquire "verify-modes-$$" || exit $?
+lease_start_heartbeat 5
+
 python3 - <<'PY'
 import json, os, time, urllib.request
 
-B = "http://127.0.0.1:8765"
+B = os.environ.get("AGILEX_API", "http://127.0.0.1:8765")
 FAIL = []
+LEASE = os.environ.get("AGILEX_LEASE_SECRET", "")
+CONTROLLER = os.environ.get("AGILEX_CONTROLLER", "verify-modes")
 ALLOW_MIT = os.environ.get("AGILEX_ALLOW_MIT_TEST") == "1"
 ALLOW_MIT_ENABLED = os.environ.get("AGILEX_ALLOW_MIT_WHILE_ENABLED") == "1"
 
 def call(p, body=None, t=10):
-    d = None if body is None else json.dumps(body).encode()
-    r = urllib.request.Request(B + p, data=d,
-                               headers={"Content-Type": "application/json"},
+    d = None
+    headers = {"Content-Type": "application/json"}
+    if LEASE:
+        headers["X-Control-Lease"] = LEASE
+    if body is not None:
+        if isinstance(body, dict):
+            body = dict(body)
+            body.setdefault("controller", CONTROLLER)
+        d = json.dumps(body).encode()
+    r = urllib.request.Request(B + p, data=d, headers=headers,
                                method="POST" if body is not None else "GET")
     with urllib.request.urlopen(r, timeout=t) as x:
         return json.loads(x.read().decode())

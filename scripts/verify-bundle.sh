@@ -48,6 +48,27 @@ find_python() {
 find_python
 run_py() { "${PY_CMD[@]}" "$@"; }
 
+# Run one shipped test suite, require exit 0 AND at least $3 PASS lines.
+# Windows python3 stubs are already handled by find_python; never call python3
+# directly here. A failure removes BUNDLE VERIFIED via the global FAIL counter.
+run_suite() {
+  local name="$1" script="$2" min="$3" out rc n
+  if [ ! -f "$WORK/$script" ]; then
+    bad "$name: $script missing"
+    return
+  fi
+  set +e
+  out="$(run_py "$WORK/$script" 2>&1)"; rc=$?
+  set -e
+  n="$(printf '%s' "$out" | grep -c '^PASS' || true)"
+  if [ "$rc" -eq 0 ] && [ "${n:-0}" -ge "$min" ]; then
+    ok "$name: $n assertions (minimum $min)"
+  else
+    bad "$name: rc=$rc, $n assertions (minimum $min)"
+    printf '%s\n' "$out" | tail -20
+  fi
+}
+
 # GNU and BSD mktemp disagree about -t. A template ending in X's works on both.
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agilex-verify.XXXXXX")" || die "cannot create a temporary directory"
 WORK="$WORK_ROOT"
@@ -82,8 +103,10 @@ fi
 echo
 echo "== shipped tree =="
 for f in server/agilex-remote-server.py server/remote-ui.html server/install-server.sh \
-         install.sh scripts/rsudo.sh scripts/agilex-lib.sh scripts/scan-secrets.sh \
-         scripts/verify-bundle.sh scripts/test-deploy-offline.sh; do
+         install.sh scripts/rsudo.sh scripts/agilex-lib.sh scripts/agilex-lease.sh \
+         scripts/scan-secrets.sh scripts/verify-bundle.sh scripts/test-deploy-offline.sh \
+         scripts/test-lease-offline.py tools/test-modes-offline.py \
+         tools/test-server-offline.py tools/test-feedback-control.py; do
   if [ -f "$WORK/$f" ]; then ok "$f present"; else bad "$f missing"; fi
 done
 [ -x "$WORK/install.sh" ] && ok "install.sh executable" || bad "install.sh not executable"
@@ -100,16 +123,15 @@ else
 fi
 
 echo
-echo "== shipped unit tests (this is the part that catches stale files) =="
-if out="$(run_py "$WORK/tools/test-modes-offline.py" 2>&1)"; then
-  n="$(printf '%s' "$out" | grep -c '^PASS' || true)"
-  ok "offline mode tests: $n assertions passed"
-  if [ "${n:-0}" -lt 40 ]; then
-    bad "only $n assertions — the regression tests are probably missing"
-  fi
+echo "== shipped test suites (all four must pass; PASS floors catch deletions) =="
+# Test-only switch used by test-deploy's meta-tests. Never set it for a release.
+if [ "${AGILEX_VERIFY_SKIP_SUITES:-0}" = "1" ]; then
+  echo "  NOTE: suite gate skipped by AGILEX_VERIFY_SKIP_SUITES=1"
 else
-  bad "offline mode tests failed"
-  printf '%s\n' "$out" | tail -15
+  run_suite "mode"     "tools/test-modes-offline.py"    41
+  run_suite "server"   "tools/test-server-offline.py"   148
+  run_suite "feedback" "tools/test-feedback-control.py" 272
+  run_suite "lease"    "scripts/test-lease-offline.py"  23
 fi
 
 echo

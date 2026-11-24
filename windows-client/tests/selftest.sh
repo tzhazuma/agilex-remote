@@ -79,21 +79,62 @@ print(s.getsockname()[1])
 s.close()'
 }
 
+to_windows_path() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$p" 2>/dev/null | tr -d '\r' && return 0
+  fi
+  if command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$p" 2>/dev/null | tr -d '\r' && return 0
+  fi
+  return 1
+}
+
 echo "== syntax =="
 if bash -n "$SCRIPT"; then pass "bash -n agilex-remote-win.sh"; else fail "bash -n agilex-remote-win.sh"; fi
 if bash -n "$SELF"; then pass "bash -n selftest.sh"; else fail "bash -n selftest.sh"; fi
 
-if command -v powershell.exe >/dev/null 2>&1; then
-  if PS1_PATH="$(cygpath -w "$PS1" 2>/dev/null || printf '%s' "$PS1")" \
-     powershell.exe -NoProfile -Command \
-     '$e=$null; [System.Management.Automation.Language.Parser]::ParseFile($env:PS1_PATH,[ref]$null,[ref]$e) | Out-Null; if($e.Count){$e | ForEach-Object { $_.Message }; exit 1}' \
-     >/dev/null 2>&1; then
-    pass "PowerShell parser accepts agilex-remote-win.ps1"
-  else
-    fail "PowerShell parser rejects agilex-remote-win.ps1"
+if command -v powershell.exe >/dev/null 2>&1 || command -v pwsh >/dev/null 2>&1; then
+  # Parse the file CONTENT, not a host-translated path. The old ParseFile()
+  # check depended on cygpath and failed under WSL-style /mnt/c paths even
+  # though the script was valid. Windows PowerShell can also be forced into
+  # ConstrainedLanguage by host policy, where the Parser .NET API is blocked;
+  # that is an environment restriction, not a syntax error. Try the native
+  # Windows PowerShell first, then pwsh, and only FAIL on a real parse error.
+  PS_PARSED=0
+  PS_ERRORS=""
+  for PS_EXE in powershell.exe pwsh.exe pwsh; do
+    command -v "$PS_EXE" >/dev/null 2>&1 || continue
+    PS_PARSE_OUT="$("$PS_EXE" -NoProfile -Command \
+      '$src=[Console]::In.ReadToEnd(); $e=$null; [System.Management.Automation.Language.Parser]::ParseInput($src,[ref]$null,[ref]$e) | Out-Null; if($e.Count){$e | ForEach-Object { $_.Message }; exit 1}' \
+      < "$PS1" 2>&1)"
+    PS_PARSE_RC=$?
+    if [ "$PS_PARSE_RC" -eq 0 ]; then
+      pass "PowerShell parser accepts agilex-remote-win.ps1 ($PS_EXE)"
+      PS_PARSED=1
+      break
+    fi
+    case "$PS_PARSE_OUT" in
+      *ConstrainedLanguage*|*CannotCreateType*|*MethodInvocationNotSupported*)
+        echo "  NOTE  $PS_EXE is in ConstrainedLanguage; trying the next parser" >&2
+        continue
+        ;;
+      *)
+        PS_ERRORS="$PS_PARSE_OUT"
+        break
+        ;;
+    esac
+  done
+  if [ "$PS_PARSED" -eq 0 ]; then
+    if [ -n "$PS_ERRORS" ]; then
+      fail "PowerShell parser rejects agilex-remote-win.ps1"
+      printf '%s\n' "$PS_ERRORS" >&2
+    else
+      echo "  SKIP  no PowerShell parser available outside ConstrainedLanguage"
+    fi
   fi
 else
-  echo "  SKIP  powershell.exe not found"
+  echo "  SKIP  powershell.exe/pwsh not found"
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/agilex-win-selftest.XXXXXX")" || {
@@ -302,14 +343,15 @@ if "$SCRIPT" --help 2>&1 | grep -q "agilex-remote-win.sh \[start\]"; then
 else
   fail "--help does not print usage"
 fi
-if command -v cmd.exe >/dev/null 2>&1; then
-  if cmd.exe //c "$(cygpath -w "$CMD" 2>/dev/null || printf '%s' "$CMD")" --help >/dev/null 2>&1; then
+WIN_CMD="$(to_windows_path "$CMD" || true)"
+if command -v cmd.exe >/dev/null 2>&1 && [ -n "$WIN_CMD" ]; then
+  if cmd.exe //c "$WIN_CMD" --help >/dev/null 2>&1; then
     pass "agilex-remote.cmd forwards --help"
   else
     fail "agilex-remote.cmd failed to forward --help"
   fi
 else
-  echo "  SKIP  cmd.exe not found"
+  echo "  SKIP  cmd.exe or Windows path conversion unavailable"
 fi
 
 echo

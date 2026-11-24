@@ -373,7 +373,10 @@
   <div class="topbar">
     <div class="brand">AgileX Remote<small>VIRTUAL CONTROLLER</small></div>
     <span id="connPill" class="pill warn" role="status" aria-live="polite">CONNECTING</span>
+    <span id="leasePill" class="pill" role="status" aria-live="polite" title="control lease">CONTROL: --</span>
     <span class="grow"></span>
+    <button id="leaseTakeBtn" class="mini" hidden title="Take control from the current controller (audited)">Take control</button>
+    <button id="leaseReleaseBtn" class="mini" hidden title="Release the control lease">Release</button>
     <button id="estopClearBtn" class="estop-clear" hidden>CLEAR E-STOP</button>
     <button id="estopBtn" class="estop" aria-label="Emergency stop: zero velocity and disable both arms">E-STOP</button>
   </div>
@@ -598,10 +601,29 @@
      requested before the panels are built. */
   var armJogStops = [];
 
+  function makeControllerId() {
+    try {
+      if (window.crypto && crypto.randomUUID) return 'ctl-' + crypto.randomUUID();
+    } catch (e) {}
+    return 'ctl-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+  function loadControllerId() {
+    try {
+      var v = sessionStorage.getItem('agilex_controller_id');
+      if (!v) { v = makeControllerId(); sessionStorage.setItem('agilex_controller_id', v); }
+      return v;
+    } catch (e) { return makeControllerId(); }
+  }
+
   var state = {
     connected: false,
     everConnected: false,
     statusFails: 0,
+    controllerId: loadControllerId(),
+    leaseSecret: null,        /* memory only; never localStorage */
+    leaseExpires: 0,
+    lease: {},
+    leaseLostNotice: false,
     estopLatch: false,        /* set by the E-STOP button; cleared only by a
                                  successful /api/estop/clear. The UI stays in the
                                  stopped state if the E-STOP POST failed - it
@@ -679,23 +701,154 @@
   /* =====================================================================
      3. API layer - every call is wrapped, times out, and can never throw
      ===================================================================== */
-  function api(method, url, body, timeoutMs) {
+  function needsLease(url, body) {
+    var p = (url || '').split('?')[0];
+    if (p.indexOf('/api/') !== 0) return false;
+    if (p === '/api/login' || p === '/api/logout') return false;
+    if (p.indexOf('/api/lease/') === 0) return false;
+    if (p === '/api/estop') return false;
+    if (p === '/api/record/status' || p === '/api/traj/list') return false;
+    if (p === '/api/drive') {
+      var lin = body ? Number(body.lin) : 0;
+      var ang = body ? Number(body.ang) : 0;
+      if (!isFinite(lin)) lin = 0;
+      if (!isFinite(ang)) ang = 0;
+      if (Math.abs(lin) < 1e-9 && Math.abs(ang) < 1e-9) return false;
+    }
+    return true;
+  }
+
+  function rawApi(method, url, body, timeoutMs) {
     var ctl = null, timer = null;
     try { ctl = new AbortController(); } catch (e) { ctl = null; }
     var opts = { method: method, cache: 'no-store' };
-    if (body !== null && body !== undefined) {
+    var send = body;
+    if (send && typeof send === 'object' && !Array.isArray(send)
+        && url.indexOf('/api/login') !== 0 && url.indexOf('/api/logout') !== 0
+        && send.controller === undefined) {
+      send = Object.assign({}, send, { controller: state.controllerId });
+    }
+    if (send !== null && send !== undefined) {
       opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = JSON.stringify(body);
+      opts.body = JSON.stringify(send);
+    }
+    if (method !== 'GET' && state.leaseSecret && url.indexOf('/api/lease/acquire') !== 0) {
+      opts.headers = opts.headers || {};
+      opts.headers['X-Control-Lease'] = state.leaseSecret;
     }
     if (ctl) { opts.signal = ctl.signal; timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, timeoutMs || 2000); }
     return fetch(url, opts).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      if (!res.ok) {
+        state.lastHttpStatus = res.status;
+        return res.json().catch(function () { return {}; }).then(function (j) {
+          state.lastHttpError = j || {};
+          if (res.status === 409) {
+            state.leaseSecret = null;
+            state.leaseExpires = 0;
+            if (j && j.lease) state.lease = j.lease;
+            renderLease();
+          }
+          return null;
+        });
+      }
+      state.lastHttpStatus = 0;
+      state.lastHttpError = null;
       return res.json();
     }).catch(function () {
-      return null;               /* never rejects: callers always get null on failure */
+      return null;
     }).then(function (v) {
       if (timer) clearTimeout(timer);
       return v;
+    });
+  }
+
+  function renderLease() {
+    var p = el('leasePill');
+    if (!p) return;
+    var l = state.lease || {};
+    var mine = !!state.leaseSecret && l.held === true && l.controller === state.controllerId;
+    var other = l.held === true && !mine;
+    var secs = Math.max(0, Math.round((state.leaseExpires - Date.now()) / 1000));
+    setText(p, mine ? ('CONTROL: YOU \u00b7 ' + secs + 's')
+                    : (other ? ('CONTROL: ' + (l.controller || 'other')) : 'CONTROL: free'));
+    setClass(p, 'pill ' + (mine ? 'ok' : (other ? 'warn' : '')));
+    p.title = l.held ? ('controller ' + l.controller + ', expires in ' + (l.expires_in || '?') + 's')
+                     : 'no controller holds the lease';
+    var tb = el('leaseTakeBtn'), rb = el('leaseReleaseBtn');
+    if (tb) tb.hidden = !other;
+    if (rb) rb.hidden = !mine;
+  }
+
+  function clearLease(notify) {
+    state.leaseSecret = null;
+    state.leaseExpires = 0;
+    if (notify) toast('Control lease lost \u2014 take control again', true);
+    renderLease();
+  }
+
+  function ensureLease() {
+    if (state.leaseSecret && state.leaseExpires > Date.now() + 2000) return Promise.resolve(true);
+    if (state.leaseSecret) clearLease(false);
+    return rawApi('POST', '/api/lease/acquire', { controller: state.controllerId }, 3000).then(function (r) {
+      if (r && r.ok && r.lease) {
+        state.leaseSecret = r.lease;
+        state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+        state.lease = { held: true, controller: r.controller || state.controllerId,
+                        expires_in: r.expires_in || 20 };
+        state.leaseLostNotice = false;
+        renderLease();
+        return true;
+      }
+      var e = state.lastHttpError || {};
+      var why = (e.error || 'control lease held');
+      if (!state.leaseLostNotice) {
+        toast('Control lease: ' + why + ' \u2014 use Take control', true);
+        state.leaseLostNotice = true;
+      }
+      if (e.lease) state.lease = e.lease;
+      renderLease();
+      pollStatus();
+      return false;
+    });
+  }
+
+  function api(method, url, body, timeoutMs) {
+    if (method === 'POST' && needsLease(url, body)) {
+      return ensureLease().then(function (ok) {
+        if (!ok) return { ok: false, lease: true, error: 'control lease required' };
+        return rawApi(method, url, body, timeoutMs);
+      });
+    }
+    return rawApi(method, url, body, timeoutMs);
+  }
+
+  function takeControl() {
+    var l = state.lease || {};
+    if (!window.confirm('Take control from ' + (l.controller || 'the other controller')
+        + '?\n\nThat client will lose authority to move the robot.')) return;
+    state.leaseLostNotice = false;
+    rawApi('POST', '/api/lease/acquire',
+           { controller: state.controllerId, takeover: true, confirm: 'TAKEOVER' }, 4000)
+      .then(function (r) {
+        if (r && r.ok && r.lease) {
+          state.leaseSecret = r.lease;
+          state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+          state.lease = { held: true, controller: r.controller || state.controllerId,
+                          expires_in: r.expires_in || 20 };
+          toast('Control acquired');
+        } else {
+          toast('Take control failed' + (r && r.error ? ': ' + r.error : ''), true);
+        }
+        pollStatus(); renderLease();
+      });
+  }
+
+  function releaseLease() {
+    if (!state.leaseSecret) { clearLease(false); return; }
+    rawApi('POST', '/api/lease/release', { controller: state.controllerId }, 3000).then(function (r) {
+      if (r && r.ok) { clearLease(false); toast('Control released'); }
+      else { clearLease(false); toast('Release failed \u2014 lease no longer yours', true); }
+      pollStatus();
     });
   }
 
@@ -710,7 +863,7 @@
       state.sending = false;
       if (r && r.ok === true) {
         driveFails = 0;
-      } else if (countFailure) {
+      } else if (countFailure && !(r && r.lease)) {
         driveFails++;
         if (driveFails >= 4) setConnected(false);   /* link is unusable: stop commanding */
       }
@@ -805,6 +958,11 @@
     }
     if (typeof s.watchdog_ms === 'number' && s.watchdog_ms > 0) state.watchdogMs = s.watchdog_ms;
     state.serverEstop = !!s.estop;
+    state.lease = s.lease || {};
+    var lease = state.lease;
+    if (state.leaseSecret && (!lease.held || lease.controller !== state.controllerId)) {
+      clearLease(true);
+    }
 
     var ch = s.chassis || {};
     setText(el('rBatt'), (typeof ch.battery_v === 'number' ? ch.battery_v.toFixed(1) : '--') + ' V');
@@ -839,6 +997,7 @@
       + state.limits.max_joint_step_deg + '\u00b0 per joint step.');
     renderEstop();
     renderConnection();
+    renderLease();
     renderDriveState();
     renderStepCap();
   }
@@ -849,6 +1008,7 @@
     a.enabledAll = !!ar.enabled_all;
     a.motorsEnabled = (typeof ar.motors_enabled === 'number') ? ar.motors_enabled : null;
     a.feedbackOk = ar.feedback_ok !== false;
+    a.feedbackFault = !!ar.feedback_fault;
     a.firmware = ar.firmware || '';
     a.errorCode = (typeof ar.error_code === 'number') ? ar.error_code : null;
     if (Array.isArray(ar.joints_deg)) a.joints = ar.joints_deg.slice(0, 6);
@@ -1229,7 +1389,7 @@
     renderEstop();
     renderConnection();
     renderDriveState();
-    api('POST', '/api/estop', null, 2500).then(function (r) {
+    api('POST', '/api/estop', {}, 2500).then(function (r) {
       if (r && r.estop === true) {
         state.serverEstop = true;
         var msg = 'E-STOP engaged (torque off' + (origin ? ' via ' + origin : '') + ')';
@@ -1247,7 +1407,8 @@
     });
   }
   function clearEstop() {
-    api('POST', '/api/estop/clear', null, 2500).then(function (r) {
+    if (!window.confirm('Clear the software E-STOP? This needs the control lease; the arms stay disabled and must be enabled explicitly.')) return;
+    api('POST', '/api/estop/clear', { confirm: 'CLEAR' }, 2500).then(function (r) {
       if (r && r.estop === false) {
         state.estopLatch = false;
         state.serverEstop = false;
@@ -2198,7 +2359,25 @@
   el('msBtn').addEventListener('click', toggleMasterSlave);
   el('estopBtn').addEventListener('click', function () { triggerEstop('button'); });
   el('estopClearBtn').addEventListener('click', clearEstop);
+  el('leaseTakeBtn').addEventListener('click', takeControl);
+  el('leaseReleaseBtn').addEventListener('click', releaseLease);
   el('retryBtn').addEventListener('click', function () { pollStatus(); toast('Retrying…'); });
+  renderLease();
+  /* Short lease: heartbeat while this page holds it. A hidden/throttled tab
+     simply lets it expire, which frees control for someone else. */
+  setInterval(function () {
+    if (!state.leaseSecret) return;
+    rawApi('POST', '/api/lease/heartbeat', {}, 2500).then(function (r) {
+      if (r && r.ok) {
+        state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+        if (state.lease) state.lease.expires_in = r.expires_in || 20;
+        renderLease();
+      } else {
+        clearLease(true);
+        pollStatus();
+      }
+    });
+  }, 5000);
   var speedEl = el('speed');
   speedEl.addEventListener('input', function () {
     state.speedPct = clamp(parseInt(this.value, 10) || 50, 10, 100);

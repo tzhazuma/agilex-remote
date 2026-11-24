@@ -24,19 +24,31 @@ EOF
   exit 2
 fi
 
-python3 - <<'PY'
-import json, time, urllib.request
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$HERE/agilex-lease.sh"
+lease_acquire "mode-smoke-$$" || exit $?
+lease_start_heartbeat 5
 
-BASE = "http://127.0.0.1:8765"
+python3 - <<'PY'
+import json, os, time, urllib.request
+
+BASE = os.environ.get("AGILEX_API", "http://127.0.0.1:8765")
 FAIL = []
+LEASE = os.environ.get("AGILEX_LEASE_SECRET", "")
+CONTROLLER = os.environ.get("AGILEX_CONTROLLER", "mode-smoke")
 
 def call(path, body=None, timeout=8):
     url = BASE + path
     data = None
+    headers = {"Content-Type": "application/json"}
+    if LEASE:
+        headers["X-Control-Lease"] = LEASE
     if body is not None:
+        if isinstance(body, dict):
+            body = dict(body)
+            body.setdefault("controller", CONTROLLER)
         data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data,
-                                 headers={"Content-Type": "application/json"},
+    req = urllib.request.Request(url, data=data, headers=headers,
                                  method="POST" if body is not None else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())

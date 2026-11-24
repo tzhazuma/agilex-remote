@@ -65,7 +65,7 @@ copy_tree() {
 
 echo
 echo "== required helper scripts =="
-for f in agilex-lib.sh rsudo.sh scan-secrets.sh verify-bundle.sh test-deploy-offline.sh; do
+for f in agilex-lib.sh agilex-lease.sh rsudo.sh scan-secrets.sh verify-bundle.sh test-deploy-offline.sh; do
   if [ -f "$HERE/$f" ]; then pass "scripts/$f exists"; else fail "scripts/$f missing"; fi
 done
 if [ -f "$ROOT/server/install-server.sh" ]; then pass "server/install-server.sh exists"; else fail "server/install-server.sh missing"; fi
@@ -272,7 +272,7 @@ else
   if [ "${AGILEX_IN_BUNDLE:-0}" = "1" ]; then
     note "skipping verify-bundle self-tests while running inside verify-bundle"
   else
-    out="$(PYTHON="$PYBIN" bash "$VB" 2>&1)"; rc=$?
+    out="$(AGILEX_VERIFY_SKIP_SUITES=1 PYTHON="$PYBIN" bash "$VB" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       pass "verify-bundle passes with a working interpreter"
     else
@@ -287,7 +287,7 @@ else
 exit 49
 EOF
     chmod +x "$TMP/fakebin/python3"
-    out="$(env -u PYTHON -u PY PATH="$TMP/fakebin:$PATH" bash "$VB" 2>&1)"; rc=$?
+    out="$(env -u PYTHON -u PY AGILEX_VERIFY_SKIP_SUITES=1 PATH="$TMP/fakebin:$PATH" bash "$VB" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       pass "verify-bundle falls back when python3 exists but does not run"
     else
@@ -297,7 +297,7 @@ EOF
 
     copy_tree "$TMP/tree-secret" "$ROOT"
     printf 'AGILEX_%s=%s\n' PW 'hunter2' >> "$TMP/tree-secret/scripts/agilex-lib.sh"
-    out="$(cd "$TMP/tree-secret" && PYTHON="$PYBIN" bash scripts/verify-bundle.sh 2>&1)"; rc=$?
+    out="$(cd "$TMP/tree-secret" && AGILEX_VERIFY_SKIP_SUITES=1 PYTHON="$PYBIN" bash scripts/verify-bundle.sh 2>&1)"; rc=$?
     if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qiE 'secret|credential'; then
       pass "verify-bundle fails on a planted credential"
     else
@@ -306,7 +306,7 @@ EOF
 
     copy_tree "$TMP/tree-norsudo" "$ROOT"
     rm -f "$TMP/tree-norsudo/scripts/rsudo.sh"
-    out="$(cd "$TMP/tree-norsudo" && PYTHON="$PYBIN" bash scripts/verify-bundle.sh 2>&1)"; rc=$?
+    out="$(cd "$TMP/tree-norsudo" && AGILEX_VERIFY_SKIP_SUITES=1 PYTHON="$PYBIN" bash scripts/verify-bundle.sh 2>&1)"; rc=$?
     if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'rsudo'; then
       pass "verify-bundle flags a missing rsudo.sh"
     else
@@ -378,6 +378,44 @@ EOF
         AGILEX_HOST=robot.invalid "$RSUDO" -c 'true' </dev/null 2>&1)"; rc=$?
   [ "$rc" -ne 0 ] && pass "rsudo.sh fails closed without a password or TTY" \
     || fail "rsudo.sh proceeded without a password"
+fi
+
+echo
+echo "== lease helper / run-smolvla client (fake API) =="
+if [ -f "$HERE/test-lease-offline.py" ]; then
+  out="$("$PYBIN" "$HERE/test-lease-offline.py" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    n="$(printf '%s' "$out" | grep -c '^PASS' || true)"
+    if [ "${n:-0}" -ge 23 ]; then
+      pass "lease fake-API tests: $n checks"
+    else
+      fail "only $n lease assertions (minimum 23)"
+    fi
+  else
+    fail "lease fake-API tests failed (rc=$rc)"
+    printf '%s\n' "$out" | tail -20
+  fi
+else
+  fail "scripts/test-lease-offline.py missing"
+fi
+for f in verify-modes.sh mode-smoke.sh; do
+  if grep -q 'agilex-lease.sh' "$HERE/$f" && grep -q 'lease_acquire' "$HERE/$f"; then
+    pass "$f acquires a control lease"
+  else
+    fail "$f does not acquire a control lease"
+  fi
+done
+if grep -q 'class LeaseSession' "$ROOT/tools/run-smolvla.py" \
+   && grep -q 'LeaseLost' "$ROOT/tools/run-smolvla.py"; then
+  pass "run-smolvla.py has a lease client with 409 handling"
+else
+  fail "run-smolvla.py has no lease client"
+fi
+if grep -q 'lease_clear_estop' "$HERE/agilex-lease.sh" \
+   && grep -q 'confirm=CLEAR' "$HERE/agilex-lease.sh"; then
+  pass "helper implements clear-with-lease-and-confirm"
+else
+  fail "helper does not implement clear-with-lease-and-confirm"
 fi
 
 echo

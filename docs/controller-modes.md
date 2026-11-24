@@ -65,6 +65,13 @@ observed on this robot:
 
 All POST, JSON, `arm` is `0` = left, `1` = right.
 
+Control POSTs now require the single-controller lease. For shell use
+`scripts/agilex-lease.sh` (`lease_acquire`, `lease_curl`, `lease_release`) rather
+than raw `curl`; a missing/expired lease returns HTTP 409. `/api/estop` and a
+zero-velocity `/api/drive` are exempt. `/api/estop/clear` is not exempt: it
+requires a lease and body `{"confirm":"CLEAR"}`. `/api/traj/list` is a
+read-only POST and is also exempt.
+
 | Endpoint | Body | Effect |
 |---|---|---|
 | `/api/arm/mode` | `{arm, mode}` | `pos_j` / `pos_p` / `mit` / `movec` |

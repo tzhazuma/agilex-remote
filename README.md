@@ -268,6 +268,132 @@ the password is chosen at install time (there is no default, see `AGILEX_PASSWOR
 
 Loopback is exempt, so `ssh -L 8765:127.0.0.1:8765 robot` skips the login.
 
+### Control lease (single controller)
+
+Motion is single-controller by design. All non-GET **control** POSTs
+(`/api/arm*`, `/api/gripper`, `/api/arm/mode|mit|movec`, `/api/traj/load|play|pause|stop`,
+`/api/teach`, `/api/master-slave`, `/api/record/start|stop`,
+`/api/chassis/clear-fault`, and non-zero `/api/drive`) require a short-lived lease.
+`GET /api/status`, `/frame`, `/video` and `GET /api/lease/status` stay open.
+**E-STOP itself is exempt**; a zero-velocity `/api/drive` is also exempt.
+`/api/estop/clear` is **not** a panic action: it requires a valid lease and
+body `{"confirm":"CLEAR"}`, so one tab cannot clear another operator's latch.
+The UI's clear button must acquire the lease and send that confirm.
+
+```bash
+# 1. acquire once; keep the secret in memory (the shell helper uses a 0600
+#    curl config file, never a log)
+curl -s -X POST http://127.0.0.1:8765/api/lease/acquire \
+  -H 'Content-Type: application/json' -d '{"controller":"laptop-1"}'
+# => {"ok":true,"lease":"<random>","controller":"laptop-1","expires_in":20.0,...}
+
+# 2. every control POST carries the secret in this header
+curl -s -X POST http://127.0.0.1:8765/api/arm \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Lease: $LEASE" \
+  -d '{"arm":0,"joint":0,"delta_deg":0.1}'
+
+# 3. extend before the 20 s TTL expires
+curl -s -X POST http://127.0.0.1:8765/api/lease/heartbeat \
+  -H "X-Control-Lease: $LEASE" -d '{}'
+
+# 4. release (only the holder can)
+curl -s -X POST http://127.0.0.1:8765/api/lease/release \
+  -H "X-Control-Lease: $LEASE" -d '{"controller":"laptop-1"}'
+
+# 5. explicit takeover; requires the exact confirm token and is audited
+curl -s -X POST http://127.0.0.1:8765/api/lease/acquire \
+  -H 'Content-Type: application/json' \
+  -d '{"controller":"laptop-2","takeover":true,"confirm":"TAKEOVER"}'
+```
+
+For shell scripts, source `scripts/agilex-lease.sh` instead of hand-rolling the
+header. It acquires, writes the secret to a 0600 curl config file (never argv or
+logs), auto-releases on EXIT, and can heartbeat a long run:
+
+```bash
+. scripts/agilex-lease.sh
+lease_acquire "my-script" || exit $?
+lease_start_heartbeat 5
+lease_curl /api/arm '{"arm":0,"joint":0,"delta_deg":0.1}'
+lease_clear_estop        # lease + {"confirm":"CLEAR"}; fails without both
+lease_release
+```
+
+`lease_curl` returns 0 only for HTTP 2xx. HTTP 409 returns 9, and any other
+non-2xx (including 500) returns 1, so a failed E-STOP/zero-speed request is
+never reported as success.
+
+`tools/run-smolvla.py` does the same in Python: it acquires before the first
+command, heartbeats in a daemon thread, turns a 409 into `LeaseLost`, and
+releases in `finally`. `--dry-run` is a truly offline check: no policy load,
+no server request, no lease.
+`verify-modes.sh` and `mode-smoke.sh` acquire automatically; their explicit
+`AGILEX_ALLOW_MODE_TESTS=1` safety gate is unchanged.
+
+> `tools/feedback_control.py` is a pure offline decoder/controller library: it
+> opens no socket and sends no HTTP, so it neither needs nor receives a lease.
+> A future online adapter that POSTs to the server must acquire the lease and
+> send `X-Control-Lease` itself.
+
+The server stores only `sha256(lease)` plus an expiry, never the secret. A missing,
+expired, or wrong secret gets HTTP 409 with the current owner in `lease`.
+The web UI does **not** acquire on page load or while watching cameras; it
+acquires on the first active action, shows `CONTROL: YOU` / `CONTROL: <id>` /
+`CONTROL: free`, and provides **Take control** (with confirm) and **Release**.
+E-STOP remains available without the lease.
+
+Every control POST is audited as one JSON line in the service journal (stderr):
+UTC time, client address, controller id, path, a whitelist-summarized body, and
+result. The controller is the **lease holder** when a valid lease is presented;
+lease-exempt requests are marked `controller_verified:false`. Password, cookie,
+token, and lease values are never written. Successful non-zero `/api/drive`
+audits are sampled (default 1/s); zero drive and errors are always recorded.
+
+### Feedback safety and stop behavior
+
+Joint feedback is re-validated on **every** 5 Hz read, not just at startup: all
+six values must be finite, and an all-zero pose is rejected by default because a
+silent CAN bus reports exactly that. A genuine arm parked at zero is legal but
+indistinguishable, so it needs an explicit opt-in:
+
+```bash
+AGILEX_ALLOW_ZERO_POSE=1   # only for an arm you have confirmed is parked at 0°
+```
+
+Do not set this to paper over a dead bus: the startup probe still requires the
+CAN RX counter to advance. While feedback is stale or invalid, every motion
+entry point (nudge, target, home, gripper, trajectory, teach, master/slave)
+returns failure, and `connected` is false.
+
+What a stop does depends on what owns the arm:
+
+| Active source | Stop action |
+|---|---|
+| Plain MOVE J | Stop sending `JointCtrl` and hold the measured pose. **No `DisableArm`**: dropping torque on a raised arm is worse than stopping the stream. |
+| Drag teach | `MotionCtrl_1(grag_teach_ctrl=0x02)` (documented "end record"). |
+| Master/slave | `MasterSlaveConfig(linkage_config=0x00)` (unlink). |
+| MOVE C | `MotionCtrl_1(emergency_stop=0x01)` (0x02 is resume). If that frame itself fails, `DisableArm` is the permitted last resort. |
+
+The same table applies to E-STOP, lease expiry/release/takeover, and a latched
+feedback fault. E-STOP additionally calls `DisableArm` because it is a panic
+action.
+
+The first lease acquire (`free → held`) deliberately does **not** cancel
+motion: the usual sequence is "take the lease, then start the trajectory".
+Only release, expiry, takeover, or a missed release+re-acquire cancels.
+
+### MIT gain bounds
+
+`/api/arm/mit` and `ArmBridge.set_mit` enforce the same conservative box before
+anything reaches the motors: `kp` 0–500, `kd` 0–50, `t_ref` −20–20. NaN, Inf,
+negative gains, empty lists, and out-of-box values return HTTP 400 and leave the
+previous gains untouched. Bench-specific ceilings can be raised with
+`AGILEX_MIT_KP_MAX` / `AGILEX_MIT_KD_MAX`; `t_ref` is fixed.
+
+A request body that is valid JSON but not an object (a list, string, number) gets
+HTTP 400 before any gate runs, instead of closing the connection.
+
 ### Android
 
 ```bash
@@ -439,12 +565,16 @@ sudo systemctl restart agilex-remote
 | Arm speed | `AGILEX_ARM_SPEED_PCT` | 25 % |
 | Max target lag | `AGILEX_MAX_TARGET_LAG` | 15° |
 | Resync tolerance | `AGILEX_RESYNC_MARGIN` | 5° |
+| Feedback staleness | `AGILEX_FEEDBACK_STALE_S` | 2 s |
+| Accept an all-zero pose | `AGILEX_ALLOW_ZERO_POSE` | `0` (reject) |
+| MIT kp / kd ceiling | `AGILEX_MIT_KP_MAX` / `AGILEX_MIT_KD_MAX` | 500 / 50 |
 | ntfy topic | `~/.config/agilex/ntfy-topic` | none |
 
 ## Tests
 
 ```bash
 python3 tools/test-modes-offline.py     # 41 assertions, fake CAN, no hardware
+python3 scripts/test-lease-offline.py   # fake lease API: acquire/heartbeat/409/release
 ./scripts/verify-modes.sh               # hardware read-back; NOT motion-free (see gate)
 ./scripts/mode-smoke.sh                 # MOVE P + trajectory replay; NOT motion-free
 ./scripts/verify-bundle.sh <zip>        # prove the SHIPPED tree works, from a clean extract
@@ -462,6 +592,7 @@ workspace and set `AGILEX_ALLOW_MODE_TESTS=1`. MIT additionally needs
 
 `verify-bundle.sh` exists because a stale copy of the test file was once copied
 over the fixed one, silently dropping the regression tests while the bundle
-still built and shipped. It extracts the zip to a throwaway directory, runs the
-shipped tests, checks every shell script parses, and scans for credentials and
+still built and shipped. It extracts the zip to a throwaway directory, runs all
+four shipped suites (mode 41+, server 370+, feedback 272+, lease 23+) with PASS
+floors, checks every shell script parses, and scans for credentials and
 real addresses. Run it before publishing.

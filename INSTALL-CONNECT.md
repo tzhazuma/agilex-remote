@@ -168,6 +168,11 @@ ssh -N -L 8765:127.0.0.1:8765 agilex@<机器人地址>
 
 输入第 2 节设的密码。浏览器会拿到一个 cookie；局域网内不要把这个 cookie 或密码分享出去。
 
+控制动作还需要一个短期 control lease：网页会在第一次主动动作时自动获取，
+E-STOP 本身不需要。清除 E-STOP 例外：必须有 lease 且带 `confirm="CLEAR"`。
+用 curl/脚本控制时先 `POST /api/lease/acquire`，后续控制 POST 带
+`X-Control-Lease` 头；详见 `README.md` 的 “Control lease” 一节。
+
 ### 3.4 安卓
 
 `android/` 是 WebView 壳，用 `android/build.sh` 自行构建。它走同一条 ntfy 通道自动发现机器人。
@@ -211,22 +216,39 @@ curl -s "http://127.0.0.1:8765/frame?cam=2" -o /tmp/c2.jpg && file /tmp/c2.jpg
 2. 点 **Enable arm**（`POST /api/arm/enable`）。使能前服务会把目标对齐到实测角度，所以**不会跳**。
 3. 用 1° 的 nudge 试一下，确认方向和幅度。
 4. **先别碰** MIT / 拖动示教 / 主从联动 / MOVE C —— 这四种会让手臂变柔顺或交给链路，需要人盯着第一次跑。
+   `/api/arm/mit` 的 `kp` / `kd` / `t_ref` 有服务端范围（0–500 / 0–50 / ±20），
+   负数、NaN、超范围都返回 400 且不改动原增益。
 
-采集轨迹：
+> 反馈安全：服务器每次读关节反馈都会校验有限性，并默认拒绝全零姿态（它与
+> CAN 静默无法区分）。如果确认手臂就是停在全零附近，用
+> `AGILEX_ALLOW_ZERO_POSE=1` 显式允许。反馈 stale/非法时，普通 MOVE J 只停
+> 输出并保持力矩；拖动示教 / 主从 / MOVE C 会发对应的硬件停止帧，MOVE C
+> 停止帧写失败才退回 `DisableArm`。
+
+采集轨迹（会走控制 lease；先 acquire，退出时自动释放）：
 
 ```bash
-curl -X POST :8765/api/record/start -d '{"task":"pick"}'
+. scripts/agilex-lease.sh
+lease_acquire "manual-$$" || exit $?
+trap 'lease_release' EXIT
+
+lease_curl /api/record/start '{"task":"pick"}'
 #  ... 操作 ...
-curl -X POST :8765/api/record/stop  -d '{"success":true}'
+lease_curl /api/record/stop  '{"success":true}'
 ```
 
 回放一段轨迹：
 
 ```bash
-curl -X POST :8765/api/traj/list
-curl -X POST :8765/api/traj/load-file -d '{"arm":0,"path":"/home/agilex/agilex-data/episodes/episode_0042"}'
-curl -X POST :8765/api/traj/play      -d '{"arm":0,"loop":false,"speed":0.5}'
+lease_curl /api/traj/list '{}'
+lease_curl /api/traj/load-file '{"arm":0,"path":"/home/agilex/agilex-data/episodes/episode_0042"}'
+lease_curl /api/traj/play      '{"arm":0,"loop":false,"speed":0.5}'
 ```
+
+> E-STOP 本身和 `lin=0,ang=0` 的 `/api/drive` 不需要 lease，所以急停/零速路径
+> 不会被 lease 阻断。清 E-STOP 不是急停动作：它需要有效 lease + body
+> `{"confirm":"CLEAR"}`（helper 的 `lease_clear_estop`）。其他控制 POST 没有
+> lease 会返回 HTTP 409。
 
 ---
 
