@@ -32,7 +32,9 @@ That is inherent to ROS control - the physical remote stops driving it.
 """
 
 import csv
+import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -68,34 +70,74 @@ PORT = int(os.environ.get("AGILEX_REMOTE_PORT", "8765"))
 #
 #   AGILEX_PASSWORD   - the password (default "changeme")
 #   AGILEX_ALLOW_ANON - 1 disables the check entirely
+#   AGILEX_SESSION_TTL - seconds a login cookie stays valid (default 12 h)
 ALLOW_ANON = os.environ.get("AGILEX_ALLOW_ANON", "0") == "1"
 PASSWORD = os.environ.get("AGILEX_PASSWORD", "changeme")
-SESSION_FILE = os.environ.get("AGILEX_SESSION_FILE",
-                              "/usr/local/share/agilex-remote/.session")
+SESSION_TTL_S = float(os.environ.get("AGILEX_SESSION_TTL", str(12 * 3600)))
+SESSION_MAX = int(os.environ.get("AGILEX_SESSION_MAX", "32"))
 COOKIE_NAME = "agilex_sid"
 
 
-def load_or_make_session():
-    """A stable session secret, so logins survive a service restart."""
-    try:
-        with open(SESSION_FILE) as f:
-            s = f.read().strip()
-            if s:
-                return s
-    except Exception:
-        pass
-    s = secrets.token_urlsafe(32)
-    try:
-        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
-        with open(SESSION_FILE, "w") as f:
-            f.write(s)
-        os.chmod(SESSION_FILE, 0o600)
-    except Exception as e:
-        log(f"could not persist session secret ({e!r}); logins reset on restart")
-    return s
+class SessionStore:
+    """Per-login sessions with a TTL and a hard cap.
+
+    The previous design used one process-wide token persisted to disk, handed to
+    every browser and accepted via ?token= forever. A leaked token was therefore
+    permanent remote control. Sessions are now per-login, expire, are revoked on
+    logout, and the raw token is never stored server-side - only its SHA-256.
+    Restarting the service invalidates every session; that is deliberate.
+    """
+
+    def __init__(self, ttl=None, max_sessions=None):
+        self.ttl = float(SESSION_TTL_S if ttl is None else ttl)
+        self.max_sessions = int(SESSION_MAX if max_sessions is None else max_sessions)
+        self._sessions = {}          # sha256(token) -> expiry epoch
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _purge_locked(self, now):
+        for key, exp in list(self._sessions.items()):
+            if exp <= now:
+                self._sessions.pop(key, None)
+
+    def create(self):
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self._lock:
+            self._purge_locked(now)
+            if len(self._sessions) >= self.max_sessions:
+                oldest = min(self._sessions, key=self._sessions.get)
+                self._sessions.pop(oldest, None)
+            self._sessions[self._key(token)] = now + self.ttl
+        return token
+
+    def valid(self, token):
+        if not token:
+            return False
+        now = time.time()
+        with self._lock:
+            self._purge_locked(now)
+            exp = self._sessions.get(self._key(token))
+            return exp is not None and exp > now
+
+    def revoke(self, token):
+        if not token:
+            return
+        with self._lock:
+            self._sessions.pop(self._key(token), None)
 
 
-ACCESS_TOKEN = None  # set in main()
+def session_cookie(token, ttl):
+    return ("%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d"
+            % (COOKIE_NAME, token, max(1, int(ttl))))
+
+
+def clear_cookie():
+    return "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" % COOKIE_NAME
+
 
 LOGIN_PAGE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8">
@@ -171,6 +213,17 @@ MAX_JOINT_STEP_DEG = float(os.environ.get("AGILEX_MAX_JOINT_STEP", "2.0"))
 # How far the held target may ever sit from the measured angle. Bounds the
 # damage if a motor stops following; see ArmBridge.nudge for why.
 MAX_TARGET_LAG_DEG = float(os.environ.get("AGILEX_MAX_TARGET_LAG", "15.0"))
+# How old the 5 Hz joint feedback may be before an arm is considered unhealthy.
+# `connected` used to latch at startup, so a bus that died later still looked
+# fine; the UI and check scripts then trusted frozen numbers.
+FEEDBACK_STALE_S = float(os.environ.get("AGILEX_FEEDBACK_STALE_S", "2.0"))
+# Re-read the arm's own mode periodically. mode_actual used to be updated only
+# on mode changes, so an externally changed mode went unnoticed.
+MODE_POLL_S = float(os.environ.get("AGILEX_MODE_POLL_S", "5.0"))
+MODE_STALE_S = float(os.environ.get("AGILEX_MODE_STALE_S", "15.0"))
+# MOVE C dispatches Cartesian EndPose frames with no joint-space lag guard.
+# It is experimental, so it must be opted into explicitly after a risk review.
+ENABLE_MOVEC = os.environ.get("AGILEX_ENABLE_MOVEC", "0") == "1"
 # How far outside the datasheet joint limits a "hold where you are" resync
 # may go. The arm really does rest a couple of degrees outside them (left
 # J2 -2.06 vs 0..180, J3 +1.44 vs -170..0), and clamping that away creates a
@@ -483,6 +536,8 @@ class ArmBridge:
         self.joints = [0.0] * 6       # target, degrees
         self._measured = [0.0] * 6
         self._meas_ok = False
+        self._last_feedback = 0.0
+        self._last_mode_check = 0.0
         self.joints_enabled = [False] * 6
         self.faults = [[] for _ in range(6)]
         self.gripper = 0.0
@@ -536,7 +591,7 @@ class ArmBridge:
             self._read_measured()
             # Record what the arm says it is in, so /api/status reports the
             # hardware truth from the first second rather than "not verified".
-            self.mode_actual = self._read_actual_mode()
+            self._note_mode(self._read_actual_mode())
             # Adopt whatever the arm is already doing as our starting intent, so
             # an arm left enabled by a previous session is usable immediately.
             self.enabled = any(self.joints_enabled)
@@ -563,6 +618,7 @@ class ArmBridge:
             raw = [js.joint_1, js.joint_2, js.joint_3, js.joint_4, js.joint_5, js.joint_6]
             self._measured = [v * 0.001 for v in raw]
             self._meas_ok = True
+            self._last_feedback = time.time()
             st = self.iface.GetArmEnableStatus()
             self.joints_enabled = [bool(x) for x in st][:6]
             # NOTE: this does NOT touch self.enabled. self.enabled is the user's
@@ -692,9 +748,17 @@ class ArmBridge:
         """5 Hz: read joints / enable / faults / gripper, off the control path."""
         n = 0
         t_start = time.time()
+        last_mode = 0.0
         while not self._stop.is_set():
             n += 1
             self._read_measured()
+            now = time.time()
+            # mode_actual used to be frozen at the last mode change. Re-read it
+            # here (a separate thread, so the 50 Hz command stream is untouched)
+            # so an arm that silently reverted to its own planner is visible.
+            if now - last_mode >= MODE_POLL_S:
+                last_mode = now
+                self._note_mode(self._read_actual_mode())
             elapsed = time.time() - t_start
             if elapsed > 0:
                 self.feedback_hz = round(n / elapsed, 1)
@@ -723,21 +787,27 @@ class ArmBridge:
             with self.lock:
                 self.joints = list(self._measured)
                 self._grip_target = self.gripper
-            self.set_enabled(True)
+            enabled = self.set_enabled(True)
             self._read_measured()
             log(f"arm {self.channel} reset: joints={[round(v,2) for v in self._measured]} "
                 f"enabled={self.enabled} per-joint={self.joints_enabled}")
-            return True
+            return bool(enabled)
         except Exception as e:
             log(f"arm {self.channel} reset failed: {e!r}")
             return False
 
     def go_home(self):
-        """Command the arm back to the pose it held when the server started."""
+        """Command the arm toward the pose it held when the server started.
+
+        The target is bounded by the same 15 deg measured-angle envelope as
+        every other move, so a Home press while the arm is far away moves at
+        most MAX_TARGET_LAG_DEG; press it again to continue. The endpoint
+        reports `lag_limited` so the UI can say so.
+        """
         if not self.ok:
             return None
         with self.lock:
-            self.joints = [clamp(self.home_deg[i], self.limits[i][0], self.limits[i][1])
+            self.joints = [self._clamp_target_to_lag(i, self.home_deg[i])
                            for i in range(6)]
             target = list(self.joints)
         log(f"arm {self.channel} homing to {[round(v,2) for v in target]}")
@@ -804,15 +874,13 @@ class ArmBridge:
                 # targets into an arm that is still in MOVE_P makes it fight its
                 # own planner. That is exactly the 2026-10-29 shaking incident,
                 # so check what the ARM says rather than trusting the bookkeeping.
-                expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
-                          "movec": "MOVE_C", "mit": "MOVE_J"}.get(self.mode, "MOVE_J")
+                expect = self._expected_mode_actual(self.mode)
                 actual = self._read_actual_mode()
                 if actual is not None and actual != expect:
                     self._apply_mode()
                     time.sleep(0.35)
                     actual = self._read_actual_mode()
-                self.mode_actual = actual
-                self.mode_verified = actual is None or actual == expect
+                self._note_mode(actual, expect)
                 if not self.mode_verified:
                     log(f"arm {self.side} enabled but arm reports {actual}, "
                         f"expected {expect} - re-asserted the mode; verify before use")
@@ -834,13 +902,19 @@ class ArmBridge:
                         self.iface.DisableArm(motor_num=7)
                     except Exception:
                         pass
-            # Record the INTENT. self.enabled drives the control loop and is
-            # reported (ANDed with the measured state); joints_enabled is purely
-            # what the hardware says. Forgetting this made Enable report false
-            # even though all six motors had come up.
+            # Record the INTENT separately from the hardware truth. self.enabled
+            # drives the control loop; state() reports enable_requested (intent)
+            # and enabled (any motor live) independently, because they can
+            # disagree. The return value is the VERIFIED motor result, not "the
+            # request was sent": telling the caller ok while 0/6 motors came up
+            # is the false-success bug this replaces.
             self.enabled = bool(on)
-            log(f"arm {self.channel} enabled={self.enabled} per-joint={self.joints_enabled}")
-            return True
+            motors = sum(1 for x in self.joints_enabled if x)
+            verified = (motors > 0) if on else (motors == 0)
+            log(f"arm {self.channel} enabled={self.enabled} "
+                f"motors={motors}/6 verified={verified} "
+                f"mode_verified={self.mode_verified} per-joint={self.joints_enabled}")
+            return bool(verified)
         except Exception as e:
             log(f"arm enable failed: {e!r}")
             return False
@@ -907,6 +981,26 @@ class ArmBridge:
             pass
         return None
 
+    @staticmethod
+    def _expected_mode_actual(mode):
+        return {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
+                "movec": "MOVE_C", "mit": "MOVE_J"}.get(mode, "MOVE_J")
+
+    def _note_mode(self, actual, expect=None):
+        """Record what the arm said, and only call it verified with a reading.
+
+        mode_verified used to be True when GetArmStatus could not be read at all
+        (actual is None), which is the opposite of verified. A missing reading
+        now means unverified.
+        """
+        self.mode_actual = actual
+        self._last_mode_check = time.time()
+        if actual is None:
+            self.mode_verified = False
+        else:
+            self.mode_verified = (actual == (expect or
+                                             self._expected_mode_actual(self.mode)))
+
     def set_mode(self, mode):
         """Switch control law. Resyncs the target to measured first.
 
@@ -919,6 +1013,9 @@ class ArmBridge:
         mode = str(mode or "").strip()
         if mode not in self.MODES:
             return False
+        if mode == "movec" and not ENABLE_MOVEC:
+            log(f"arm {self.side} MOVE C refused: AGILEX_ENABLE_MOVEC is not set")
+            return False
         if mode == self.mode:
             return True
         self.teaching = False
@@ -928,8 +1025,7 @@ class ArmBridge:
         old, self.mode = self.mode, mode
         ok = self._apply_mode()
         # Believe the hardware, not ourselves. One retry, then revert.
-        expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
-                  "movec": "MOVE_C", "mit": "MOVE_J"}[mode]
+        expect = self._expected_mode_actual(mode)
         actual = None
         for attempt in (1, 2):
             time.sleep(0.35)
@@ -939,18 +1035,19 @@ class ArmBridge:
             log(f"arm {self.side} mode {mode}: arm still reports {actual} "
                 f"(attempt {attempt}), re-sending")
             self._apply_mode()
-        self.mode_actual = actual
+        self._note_mode(actual, expect)
+        if actual is None:
+            log(f"arm {self.side} mode {mode}: could not read the arm's mode "
+                f"back; NOT verified - do not command motion until it reads back")
         if actual is not None and actual != expect:
             back = {"MOVE_J": "pos_j", "MOVE_P": "pos_p", "MOVE_C": "movec"}
             self.mode = back.get(actual, "pos_j")
-            self.mode_verified = False
             log(f"arm {self.side} mode {mode} REJECTED by the arm (it is in "
                 f"{actual}); bookkeeping reverted to {self.mode} so we do not "
                 f"stream into the wrong mode")
             return False
-        self.mode_verified = True
         log(f"arm {self.side} mode {old} -> {mode} (arm reports {actual}, sent={ok})")
-        return ok
+        return bool(ok and self.mode_verified)
 
     def set_mit(self, kp=None, kd=None, t_ref=None):
         """Set MIT impedance gains. Per-joint lists or scalars, 6 motors."""
@@ -980,6 +1077,12 @@ class ArmBridge:
         """
         if not self.ok:
             return {"ok": False, "error": "arm not connected"}
+        if not ENABLE_MOVEC:
+            return {"ok": False,
+                    "error": "MOVE C is disabled by default; set AGILEX_ENABLE_MOVEC=1 "
+                             "after a risk assessment"}
+        if not self.enabled or not any(self.joints_enabled):
+            return {"ok": False, "error": "arm is disabled"}
         try:
             pts = [[int(round(float(v))) for v in p[:6]] for p in (points or [])]
         except Exception as e:
@@ -987,6 +1090,13 @@ class ArmBridge:
         if len(pts) != 3:
             return {"ok": False,
                     "error": "MOVE C needs exactly 3 points (start, via, end)"}
+        # Units are 0.001 mm / 0.001 deg. Reject points that cannot be on this
+        # arm's 0.8 m reach instead of letting the controller discover it.
+        for p in pts:
+            if any(abs(v) > 2_000_000 for v in p[:3]):
+                return {"ok": False, "error": "MOVE C point outside +/-2 m"}
+            if any(abs(v) > 360_000 for v in p[3:]):
+                return {"ok": False, "error": "MOVE C orientation outside +/-360 deg"}
         try:
             self.iface.MoveCAxisUpdateCtrl(0x03)     # clear any previous arc
             time.sleep(0.1)
@@ -1167,14 +1277,35 @@ class ArmBridge:
             log(f"arm {self.side} master/slave failed: {e!r}")
             return {"ok": False, "error": repr(e)}
 
+    def _clamp_target_to_lag(self, joint, want):
+        """Clamp a requested angle to the joint limit AND the 15 deg envelope
+        around the measured angle. Caller holds self.lock.
+
+        nudge() and trajectory advance already had this guard; absolute targets
+        and Home did not, so a single request could command a 100 deg jump. A
+        destination is still a destination - it just cannot be further than
+        MAX_TARGET_LAG_DEG from where the arm actually is.
+        """
+        lo, hi = self.limits[joint]
+        meas = self._measured[joint]
+        try:
+            want = float(want)
+        except Exception:
+            want = meas
+        if not math.isfinite(want):
+            want = meas
+        want = clamp(want, lo, hi)
+        return clamp(want, max(lo, meas - MAX_TARGET_LAG_DEG),
+                     min(hi, meas + MAX_TARGET_LAG_DEG))
+
     def set_target(self, joints_deg=None, joint=None, deg=None):
         """
         ABSOLUTE target control, as opposed to the incremental nudge().
 
-        Clamped to the documented joint limits but NOT to the 2 deg step - a
-        target is a destination, not a jog. The arm's own `move_spd_rate_ctrl`
-        still bounds how fast it gets there, so a large target is not a large
-        jerk.
+        Clamped to the documented joint limits and to the same 15 deg measured-
+        angle envelope as nudge(). A large destination therefore takes several
+        requests; that is intentional, because the old behaviour let one HTTP
+        call command a 100 deg jump.
         """
         if not self.ok:
             return None
@@ -1184,15 +1315,19 @@ class ArmBridge:
                     vals = [float(v) for v in joints_deg][:6]
                 except Exception:
                     return None
-                if len(vals) < 6:
+                if len(vals) < 6 or not all(math.isfinite(v) for v in vals):
                     return None
-                self.joints = [clamp(vals[i], self.limits[i][0], self.limits[i][1])
+                self.joints = [self._clamp_target_to_lag(i, vals[i])
                                for i in range(6)]
             elif joint is not None and deg is not None:
-                j = int(joint)
-                if not (0 <= j <= 5):
+                try:
+                    j = int(joint)
+                    want = float(deg)
+                except Exception:
                     return None
-                self.joints[j] = clamp(float(deg), self.limits[j][0], self.limits[j][1])
+                if not (0 <= j <= 5) or not math.isfinite(want):
+                    return None
+                self.joints[j] = self._clamp_target_to_lag(j, want)
             else:
                 return None
             return list(self.joints)
@@ -1247,13 +1382,35 @@ class ArmBridge:
     def state(self):
         with self.lock:
             target = [round(v, 3) for v in self.joints]
+        now = time.time()
+        last_feedback = getattr(self, "_last_feedback", 0.0)
+        last_mode = getattr(self, "_last_mode_check", 0.0)
+        age = (now - last_feedback) if last_feedback else None
+        feedback_ok = bool(self._meas_ok and age is not None
+                           and age <= FEEDBACK_STALE_S)
+        motors = sum(1 for x in self.joints_enabled if x)
+        mode_age = (now - last_mode) if last_mode else None
+        mode_verified = bool(self.mode_verified and self.mode_actual is not None
+                             and mode_age is not None
+                             and mode_age <= MODE_STALE_S)
         return {
             "side": self.side,
             "can": self.channel,
-            "connected": self.ok,
-            # "enabled" = intent AND reality, so a motor that dropped out on its
-            # own still shows as not-enabled rather than silently claiming ok.
-            "enabled": bool(self.enabled and any(self.joints_enabled)),
+            # connected now means "the bus was alive at startup AND feedback is
+            # still arriving". It used to latch at startup, so a bus that died
+            # later still showed connected with frozen joint angles.
+            "connected": bool(self.ok and feedback_ok),
+            "feedback_ok": feedback_ok,
+            "feedback_age_s": None if age is None else round(age, 2),
+            # "enabled" is now the HARDWARE truth (at least one motor live);
+            # enable_requested is what the operator asked for. They can differ:
+            # a motor that refused to drop still leaves the arm energized even
+            # though the UI asked for disable. Neither is a substitute for
+            # joints_enabled; enabled_all is the stricter 6/6 form.
+            "enabled": bool(motors > 0),
+            "enabled_all": bool(motors == 6),
+            "enable_requested": bool(self.enabled),
+            "motors_enabled": motors,
             "firmware": self.firmware,
             "joints_deg": [round(v, 3) for v in self._measured],
             "targets_deg": target,
@@ -1271,7 +1428,8 @@ class ArmBridge:
             # ---- operating mode ----
             "mode": self.mode,
             "mode_actual": self.mode_actual,
-            "mode_verified": self.mode_verified,
+            "mode_verified": mode_verified,
+            "mode_age_s": None if mode_age is None else round(mode_age, 2),
             "teaching": self.teaching,
             "mit": {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
                     "t_ref": list(self.mit["t_ref"])},
@@ -1677,8 +1835,11 @@ class Control:
             "arms": arms,
             "limits": {"max_lin": MAX_LIN, "max_ang": MAX_ANG,
                        "max_joint_step_deg": MAX_JOINT_STEP_DEG,
+                       "max_target_lag_deg": MAX_TARGET_LAG_DEG,
                        # Where the slider should start, vs. what is allowed.
                        "default_lin": DEFAULT_LIN, "default_ang": DEFAULT_ANG,
+                       # MOVE C is opt-in; the UI disables the option when false.
+                       "movec_enabled": ENABLE_MOVEC,
                        # The hardware ceiling, so the UI can show what the
                        # chassis is actually capable of next to the safe default.
                        "hw_max_lin": HW_MAX_LIN, "hw_max_ang": HW_MAX_ANG,
@@ -1961,6 +2122,7 @@ class Handler(BaseHTTPRequestHandler):
     control = None
     hubs = {}
     recorder = None
+    sessions = None
     ui_bytes = b"<h1>remote-ui.html not installed</h1>"
 
     def log_message(self, *a):
@@ -1972,21 +2134,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _authorised(self):
-        """Loopback is trusted (the Mac's SSH tunnel). Others must have signed in."""
-        if ALLOW_ANON or self._from_loopback():
-            return True
+    def _cookie_token(self):
         cookie = self.headers.get("Cookie") or ""
         for part in cookie.split(";"):
             k, _, v = part.strip().partition("=")
-            if k == COOKIE_NAME and v and secrets.compare_digest(v, ACCESS_TOKEN):
-                return True
-        # ?token= also works, for a bookmark or a debugging curl
-        if "?" in self.path:
-            m = re.search(r"token=([A-Za-z0-9_\-]+)", self.path.split("?", 1)[1])
-            if m and secrets.compare_digest(m.group(1), ACCESS_TOKEN):
-                return True
-        return False
+            if k == COOKIE_NAME and v:
+                return v
+        return None
+
+    def _authorised(self):
+        """Loopback is trusted (the SSH tunnel). Others need a live session."""
+        if ALLOW_ANON or self._from_loopback():
+            return True
+        token = self._cookie_token()
+        return bool(token and self.sessions is not None
+                    and self.sessions.valid(token))
 
     def _deny(self):
         log(f"denied {self.command} {self.path} from {self.client_address[0]}")
@@ -2152,8 +2314,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login":
             b = self._body()
             pw = str(b.get("password", ""))
-            if ALLOW_ANON or self._from_loopback() or \
-               (pw and secrets.compare_digest(pw, PASSWORD)):
+            # Loopback (the SSH tunnel) already authenticated the operator at
+            # the SSH layer. Do not mint a reusable network cookie for it.
+            if self._from_loopback():
+                log(f"login from loopback {self.client_address[0]}: no cookie issued")
+                self._json({"ok": True, "loopback": True})
+                return
+            if ALLOW_ANON:
+                self._json({"ok": True, "anon": True})
+                return
+            if self.sessions is None:
+                self._json({"ok": False, "error": "session store unavailable"}, 503)
+                return
+            if pw and secrets.compare_digest(pw, PASSWORD):
+                token = self.sessions.create()
                 log(f"login OK from {self.client_address[0]}")
                 body = json.dumps({"ok": True}).encode()
                 self.send_response(200)
@@ -2161,7 +2335,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Set-Cookie",
-                                 f"{COOKIE_NAME}={ACCESS_TOKEN}; Path=/; SameSite=Lax")
+                                 session_cookie(token, self.sessions.ttl))
                 self.end_headers()
                 self.wfile.write(body)
             else:
@@ -2171,12 +2345,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/logout":
+            token = self._cookie_token()
+            if token and self.sessions is not None:
+                self.sessions.revoke(token)
             body = json.dumps({"ok": True}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Set-Cookie",
-                             f"{COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax")
+            self.send_header("Set-Cookie", clear_cookie())
             self.end_headers()
             self.wfile.write(body)
             return
@@ -2189,7 +2365,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/drive":
                 b = self._body()
                 lin, ang = c.drive(b.get("lin", 0.0), b.get("ang", 0.0))
-                self._json({"ok": True, "applied": {"lin": round(lin, 4), "ang": round(ang, 4)}})
+                # The response used to say ok:true even when nothing was
+                # published: E-STOP forces (0,0), and a dead ROS bridge silently
+                # drops the Twist. Clients must see that.
+                if c.estop:
+                    err = "E-STOP active"
+                elif not getattr(c.ros, "ok", False):
+                    err = "ROS bridge unavailable"
+                else:
+                    err = None
+                self._json({"ok": err is None,
+                            "applied": {"lin": round(lin, 4), "ang": round(ang, 4)},
+                            "error": err})
             elif path == "/api/arm":
                 b = self._body()
                 a = c.pick_arm(b)
@@ -2197,29 +2384,59 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": t is not None, "targets_deg": t})
             elif path == "/api/arm/target":
                 # Absolute position control: joints_deg for a full pose, or
-                # joint+deg for a single axis.
+                # joint+deg for a single axis. The server clamps to both the
+                # joint limit and MAX_TARGET_LAG_DEG around the measured angle.
                 b = self._body()
                 a = c.pick_arm(b)
                 t = a.set_target(joints_deg=b.get("joints_deg"),
                                  joint=b.get("joint"), deg=b.get("deg"))
-                self._json({"ok": t is not None, "targets_deg": t})
+                limited = False
+                if t is not None:
+                    if b.get("joints_deg") is not None:
+                        try:
+                            req = [float(v) for v in b["joints_deg"]][:6]
+                            limited = any(abs(t[i] - req[i]) > 1e-6
+                                          for i in range(min(6, len(req))))
+                        except Exception:
+                            limited = False
+                    elif b.get("joint") is not None and b.get("deg") is not None:
+                        try:
+                            j = int(b["joint"])
+                            limited = abs(t[j] - float(b["deg"])) > 1e-6
+                        except Exception:
+                            limited = False
+                self._json({"ok": t is not None, "targets_deg": t,
+                            "lag_limited": limited})
             elif path == "/api/arm/reset":
                 b = self._body()
                 a = c.pick_arm(b)
                 ok = a.reset()
-                self._json({"ok": ok, "enabled": a.state()["enabled"],
-                            "joints_deg": a.state()["joints_deg"],
-                            "targets_deg": a.state()["targets_deg"]})
+                st = a.state()
+                self._json({"ok": ok, "enabled": st["enabled"],
+                            "motors_enabled": st.get("motors_enabled"),
+                            "mode_verified": st.get("mode_verified"),
+                            "joints_deg": st["joints_deg"],
+                            "targets_deg": st["targets_deg"]})
             elif path == "/api/arm/home":
                 b = self._body()
                 a = c.pick_arm(b)
                 t = a.go_home()
-                self._json({"ok": t is not None, "moving_to": t})
+                limited = bool(t is not None and any(
+                    abs(t[i] - a.home_deg[i]) > 1e-6 for i in range(6)))
+                self._json({"ok": t is not None, "moving_to": t,
+                            "lag_limited": limited})
             elif path == "/api/arm/enable":
                 b = self._body()
                 a = c.pick_arm(b)
-                a.set_enabled(bool(b.get("enable", True)))
-                self._json({"ok": True, "enabled": a.state()["enabled"]})
+                ok = a.set_enabled(bool(b.get("enable", True)))
+                st = a.state()
+                self._json({"ok": bool(ok),
+                            "enabled": st["enabled"],
+                            "motors_enabled": st.get("motors_enabled"),
+                            "enabled_all": st.get("enabled_all"),
+                            "mode_actual": st.get("mode_actual"),
+                            "mode_verified": st.get("mode_verified"),
+                            "error": None if ok else "requested state not verified"})
             elif path == "/api/gripper":
                 b = self._body()
                 a = c.pick_arm(b)
@@ -2229,14 +2446,19 @@ class Handler(BaseHTTPRequestHandler):
                 b = self._body()
                 a = c.pick_arm(b)
                 ok = a.set_mode(b.get("mode"))
+                st = a.state()
                 self._json({"ok": ok, "mode": a.mode,
-                            "modes": list(a.MODES)})
+                            "modes": list(a.MODES),
+                            "mode_actual": st.get("mode_actual"),
+                            "mode_verified": st.get("mode_verified"),
+                            "error": None if ok else "mode switch not verified"})
             elif path == "/api/arm/mit":
                 b = self._body()
                 a = c.pick_arm(b)
                 g = a.set_mit(kp=b.get("kp"), kd=b.get("kd"),
                               t_ref=b.get("t_ref"))
-                self._json({"ok": True, "mit": g, "mode": a.mode})
+                self._json({"ok": bool(a.ok), "mit": g, "mode": a.mode,
+                            "error": None if a.ok else "arm not connected"})
             elif path == "/api/arm/movec":
                 b = self._body()
                 a = c.pick_arm(b)
@@ -2291,11 +2513,30 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/estop":
                 c.set_estop(True)
                 log("E-STOP engaged")
-                self._json({"ok": True, "estop": True})
+                st = c.status()
+                arms = [{"side": x.get("side"),
+                         "enabled": x.get("enabled"),
+                         "motors_enabled": x.get("motors_enabled"),
+                         "feedback_ok": x.get("feedback_ok")}
+                        for x in st.get("arms", [])]
+                # E-STOP latching and motor torque-off are two different facts.
+                # Report both instead of a bare ok:true. If feedback is stale we
+                # cannot verify torque-off, so say so rather than assuming it.
+                fresh = [x for x in arms if x.get("feedback_ok")]
+                arms_disabled = bool(fresh) and all(
+                    (x.get("motors_enabled") or 0) == 0 for x in fresh)
+                warnings = ([] if arms_disabled
+                            else ["arm torque-off not confirmed"])
+                self._json({"ok": bool(st.get("estop")), "estop": True,
+                            "arms": arms, "arms_disabled": arms_disabled,
+                            "warnings": warnings})
             elif path == "/api/estop/clear":
                 c.set_estop(False)
                 log("E-STOP cleared")
-                self._json({"ok": True, "estop": False})
+                st = c.status()
+                self._json({"ok": not st.get("estop"), "estop": False,
+                            "arms_enabled": [x.get("enabled")
+                                             for x in st.get("arms", [])]})
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
         except Exception as e:
@@ -2304,10 +2545,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ACCESS_TOKEN
     log("starting agilex remote server")
-    ACCESS_TOKEN = load_or_make_session()
-    log(f"access control: {'DISABLED (AGILEX_ALLOW_ANON=1)' if ALLOW_ANON else 'cookie required off-loopback'}")
+    Handler.sessions = SessionStore()
+    if ALLOW_ANON:
+        log("access control: DISABLED (AGILEX_ALLOW_ANON=1)")
+    else:
+        log(f"access control: per-login session cookie, ttl {int(Handler.sessions.ttl)}s, "
+            f"max {Handler.sessions.max_sessions} sessions")
     ros = RosBridge()
     # Two Piper arms, six motors each. can_left is the left arm, can_right the
     # right. Order here defines the "arm" index used by the API (0 = left).

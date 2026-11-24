@@ -8,18 +8,19 @@
 #   3. makes sure the standing SSH tunnel for port 8765 is up
 #   4. opens the controller in your browser
 #
-#   ./bin/robot-remote.sh            # start everything and open the browser
-#   ./bin/robot-remote.sh --status   # report state, change nothing
-#   ./bin/robot-remote.sh --stop     # stop tracer_base + the server
+#   ./scripts/robot-remote.sh            # start everything and open the browser
+#   ./scripts/robot-remote.sh --status   # report state, change nothing
+#   ./scripts/robot-remote.sh --stop     # stop tracer_base + the server
 #
 # ⚠️ WARNING: launching tracer_base calls EnableCommandedMode() on the chassis.
 #    That takes it OUT of RC-handset mode, so the physical remote will stop
 #    driving it until the chassis is power-cycled. That is inherent to driving
 #    it over ROS. The script asks before doing it the first time.
 #
-# SAFETY: the server clamps velocity to 0.08 m/s / 0.15 rad/s, has a 700 ms
-#    watchdog that forces a stop if commands stop arriving, and exposes an
-#    E-STOP. Movements are intentionally tiny.
+# SAFETY: the server clamps velocity server-side (default hard caps 2.3 m/s and
+#    0.7853 rad/s; the UI sliders start at 0.5 m/s and 0.3 rad/s), has a 300 ms
+#    watchdog (AGILEX_WATCHDOG_MS) that forces a stop if commands stop arriving,
+#    and exposes an E-STOP. Start with small nudges.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,7 +54,8 @@ status() {
 
 stop_all() {
   echo "stopping tracer_base + the remote server on the robot..."
-  ssh_robot 'pkill -f tracer_base_node 2>/dev/null; sudo -n systemctl stop agilex-remote.service 2>/dev/null; echo stopped' 2>&1 | tail -2
+  ssh_robot 'pkill -f tracer_base_node 2>/dev/null; echo tracer_base stopped' 2>&1 | tail -2
+  "$DIR/rsudo.sh" -c 'systemctl stop agilex-remote.service'
   launchctl bootout "gui/$(id -u)/com.example.agilex-remote-tunnel" 2>/dev/null && echo "tunnel agent stopped" || echo "(tunnel agent not running)"
 }
 
@@ -65,7 +67,7 @@ esac
 
 echo "### 1. robot reachable? ###"
 if ! ssh_robot 'echo ok' 2>/dev/null | grep -q ok; then
-  echo "ABORT: cannot reach the robot. Try ./bin/find-robot.sh" >&2
+  echo "ABORT: cannot reach the robot. Try ./scripts/find-robot.sh" >&2
   exit 1
 fi
 echo "yes ($(ssh_robot 'hostname -I' 2>/dev/null | awk '{print $1}'))."
@@ -149,10 +151,10 @@ cat <<EOF
    - arm: J1..J6 nudges, enable/disable, gripper
    - E-STOP: the red button, or Space / Esc
 
- Hard caps: $(python3 -c "import json;d=json.load(open('/tmp/agilex-status.json'));print(d['limits']['max_lin'],'m/s,',d['limits']['max_ang'],'rad/s,',d['limits']['max_joint_step_deg'],'deg/joint-step')" 2>/dev/null || echo "0.08 m/s, 0.15 rad/s, 2 deg")
- A 700 ms watchdog stops the robot if commands stop arriving.
+ Hard caps from /api/status: $(python3 -c "import json;d=json.load(open('/tmp/agilex-status.json'));print(d['limits']['max_lin'],'m/s,',d['limits']['max_ang'],'rad/s,',d['limits']['max_joint_step_deg'],'deg/joint-step')" 2>/dev/null || echo "see /api/status")
+ Watchdog: 300 ms by default (AGILEX_WATCHDOG_MS) - it is a braking distance.
 
- State: ./bin/robot-remote.sh --status
- Stop : ./bin/robot-remote.sh --stop
+ State: ./scripts/robot-remote.sh --status
+ Stop : ./scripts/robot-remote.sh --stop
 ------------------------------------------------------------------
 EOF

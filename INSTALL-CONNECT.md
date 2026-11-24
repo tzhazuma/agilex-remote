@@ -53,19 +53,20 @@ ip -details link show can_left | grep -E "state|bitrate"   # 应为 UP / 1000000
 ### 方式 A：从笔记本一键装（推荐）
 
 ```bash
-unzip agilex-remote-2026-10-29.zip
-cd agilex-remote
+unzip <交付包>.zip
+cd 02-代码
 ./install.sh agilex@<机器人地址>
 ```
 
-它会：打包 → scp 上传 → 在机器人上 `sudo` 安装 → 启动服务 → 建一条 SSH 隧道并检查 `/api/status`。
+它会：先扫描包内是否有明文凭据 → 打包 → scp 上传到机器人上的随机 `mktemp` 目录 → 在机器人上 `sudo` 安装 → 启动服务 → 建一条 SSH 隧道并检查 `/api/status` → 删除本地和机器人上的临时目录。
+过程中会提示机器人账户的 sudo 密码和要设置的网页密码；两者都不会从包里读取，也不会写进命令行参数。
 
 ### 方式 B：直接在机器人上装
 
 把包拷到机器人上，然后：
 
 ```bash
-cd agilex-remote
+cd 02-代码
 sudo ./install.sh
 ```
 
@@ -79,15 +80,43 @@ logs:    journalctl -u agilex-remote -f
 
 ### 设置网页密码
 
-安装时如果没设，默认是 **`changeme`**。密码存在：
+**没有默认密码。** 安装器按以下顺序取密码：
+
+1. 环境变量 `AGILEX_PASSWORD`；
+2. 环境变量 `AGILEX_PASSWORD_FILE` 指向的文件（只读第一行，适合自动化）；
+3. 有 TTY 时交互提示。
+
+三者都没有，或密码短于 8 位、等于旧默认值 `changeme`、含空白/引号/反斜杠时，安装器**拒绝安装**。
+密码写在机器人上：
 
 ```
-/etc/agilex-remote.env          # AGILEX_PASSWORD=...
+/etc/agilex-remote.env          # AGILEX_PASSWORD=...，模式 0600
 ```
 
-改完重启：`sudo systemctl restart agilex-remote`。
+> 这个文件是 0600，且作为**强制** `EnvironmentFile` 被 unit 引用；缺失时服务启动失败，
+> 不会悄悄回退到 Python 源码里的占位默认值。`systemctl cat` 看不到密码。
+> 安装器不会把密码写入 unit、命令行参数或 `/tmp`。
 
-> 这个文件是 0600，且不写进 systemd unit，所以 `systemctl cat` 看不到密码。
+轮换密码（不重装）：
+
+```bash
+sudo AGILEX_PASSWORD='<new-password>' ./server/install-server.sh --env-only
+sudo systemctl restart agilex-remote
+```
+
+### 从旧版本升级
+
+旧 unit 可能**没有** `EnvironmentFile`；这时服务会退回 Python 源码里的占位默认密码。
+装完先用这两条确认（不会打印密码）：
+
+```bash
+systemctl show -p EnvironmentFiles agilex-remote     # 必须出现 /etc/agilex-remote.env
+stat -c '%a %U:%G %n' /etc/agilex-remote.env         # 必须是 600 root:root
+```
+
+如果第一条为空或第二条报 missing，用本包重新执行 `sudo ./install.sh`；它会重写 unit，
+把 `EnvironmentFile` 设为强制项并生成新的密码文件。升级后旧的 `/tmp/agilex-remote*`
+目录也应删除（安装器的新版本会自己清理随机临时目录）。
 
 ---
 
@@ -253,5 +282,6 @@ sudo systemctl daemon-reload
 ./scripts/verify-bundle.sh <打包出来的.zip>
 ```
 
-它会解压到临时目录，跑**随包发布的那份测试**、检查所有 shell 语法、扫密码和真实 IP。
+它会解压到临时目录，跑**随包发布的那份测试**（模式回归 + 部署/凭据回归）、检查所有 shell 语法、扫明文密码/私钥/topic/真实地址。
+脚本兼容 GNU/BSD `mktemp`，并在 `python3` 存在但不可执行时回退到 `python` / `py -3`。
 这个脚本不是摆设：曾经有一次旧版测试文件被覆盖，回归测试静默丢失，而 bundle 照样"构建成功"。

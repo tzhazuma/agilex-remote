@@ -24,3 +24,46 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# ---------------------------------------------------------------------------
+# machine-local robot client configuration and secrets
+# ---------------------------------------------------------------------------
+# Real client.env is machine-local (host/user/identity path); examples stay tracked.
+windows-client/client.env
+*.env
+!*.env.example
+!**/*.env.example
+
+# ntfy topic files and SSH host-key state
+*.topic
+known_hosts*
+**/.ssh/id_*
+**/id_rsa
+**/id_rsa.*
+**/id_ed25519
+**/id_ed25519.*
+**/id_ecdsa
+**/id_ecdsa.*
+**/id_dsa
+**/id_dsa.*
+windows-client/id_*
+
+# client runtime state if a state dir is placed inside the checkout
+windows-client/current-host
+windows-client/seen-hosts
+windows-client/scanned-keys
+windows-client/last-status.json
+windows-client/tunnel.log
+windows-client/tunnel.pid
+windows-client/tunnel.info
+windows-client/start.lock/
+windows-client/.fingerprint*
+windows-client/.cache/
+windows-client/.state/
+
+# logs and temporary experiment output
+*.log
+*.tmp
+*.pid
+*.out
+*.err

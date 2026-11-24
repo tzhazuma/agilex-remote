@@ -7,20 +7,26 @@
 # It works out which one you meant by looking for the robot's own filesystem.
 #
 # WHAT IT DOES
-#   robot side  : copies the server + UI into /usr/local/share/agilex-remote,
-#                 installs and starts the systemd unit, prints the URL.
-#   laptop side : tars this checkout, scp's it to the robot, runs the robot side
-#                 under sudo, then checks /api/status through an SSH tunnel.
+#   robot side  : hands off to server/install-server.sh, which installs the
+#                 server + UI into /usr/local/share/agilex-remote, creates
+#                 /etc/agilex-remote.env (0600), installs the systemd unit and
+#                 starts it.
+#   laptop side : refuses to package a tree that contains credentials, tars it,
+#                 scp's it to a fresh mktemp directory on the robot, runs the
+#                 robot side under sudo, verifies /api/status through an SSH
+#                 tunnel, and removes BOTH staging directories.
+#
+# PASSWORD
+#   There is no default. install-server.sh prompts (or reads AGILEX_PASSWORD /
+#   AGILEX_PASSWORD_FILE) and refuses to install without a real password.
 #
 # REQUIREMENTS
 #   robot : python3, ffmpeg, ROS 2 Humble, piper_sdk (pip), CAN interfaces up
-#   laptop: ssh with key auth to the robot
+#   laptop: ssh with key auth to the robot, curl
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEST=/usr/local/share/agilex-remote
-UNIT=/etc/systemd/system/agilex-remote.service
-PORT="${AGILEX_PORT:-8765}"
+PORT="${AGILEX_REMOTE_PORT:-${AGILEX_PORT:-8765}}"
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -34,98 +40,82 @@ if [ -f "$HERE/server/agilex-remote-server.py" ] && [ -d /opt/ros ] && id agilex
     command -v "$f" >/dev/null || die "$f not found - install it first"
   done
 
-  install -d -m 0755 "$DEST"
-  install -m 0755 "$HERE/server/agilex-remote-server.py" "$DEST/agilex-remote-server.py"
-  install -m 0644 "$HERE/server/remote-ui.html"          "$DEST/remote-ui.html"
-
-  # Password for the web UI. Kept in an EnvironmentFile (0600) rather than in the
-  # unit, so `systemctl cat` does not leak it.
-  ENVF=/etc/agilex-remote.env
-  if [ ! -f "$ENVF" ]; then
-    PW="${AGILEX_PASSWORD:-}"
-    if [ -z "$PW" ]; then
-      if [ -t 0 ]; then
-        read -r -s -p "web UI password (blank = 'changeme'): " PW; echo
-      fi
-    fi
-    printf 'AGILEX_PASSWORD=%s\n' "${PW:-changeme}" > "$ENVF"
-    chmod 0600 "$ENVF"
-    chown root:root "$ENVF"
-  fi
-
-  say "systemd unit"
-  cat > "$UNIT" <<UNIT_EOF
-[Unit]
-Description=AgileX virtual remote controller (HTTP + MJPEG + ROS/CAN bridge)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=agilex
-Group=agilex
-WorkingDirectory=$DEST
-EnvironmentFile=-$ENVF
-Environment=AGILEX_REMOTE_HOST=0.0.0.0
-Environment=AGILEX_ALLOW_ANON=0
-Environment=ROS_DOMAIN_ID=222
-Environment=ROS_LOCALHOST_ONLY=1
-Environment=BASH_ENV=/dev/null
-ExecStartPre=+/bin/bash -c 'if ! ip link show can_left >/dev/null 2>&1 || ! ip link show can_right >/dev/null 2>&1; then cd /home/agilex/piper_ros && bash ./can_config.sh || true; sleep 2; fi'
-ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/agilex/agilex_ws/install/setup.bash 2>/dev/null; exec /usr/bin/python3 $DEST/agilex-remote-server.py'
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-UNIT_EOF
-
-  systemctl daemon-reload
-  systemctl enable agilex-remote >/dev/null 2>&1 || true
-  systemctl restart agilex-remote
-  sleep 5
-  systemctl is-active agilex-remote
-
-  IP="$(hostname -I | awk '{print $1}')"
-  say "done"
-  echo "  guide:   $HERE/INSTALL-CONNECT.md  (install / connect / troubleshooting)"
-  echo "  check:   ./scripts/check-connection.sh"
-  echo "  UI:      http://$IP:$PORT/"
-  echo "  status:  curl -s http://127.0.0.1:$PORT/api/status | head -c 400"
-  echo "  logs:    journalctl -u agilex-remote -f"
-  exit 0
+  [ -x "$HERE/server/install-server.sh" ] || die "server/install-server.sh missing"
+  AGILEX_PAYLOAD="$HERE/server" exec /bin/bash "$HERE/server/install-server.sh"
 fi
 
 # --------------------------------------------------------------- laptop side
 TARGET="${1:-}"
 [ -n "$TARGET" ] || die "usage: ./install.sh user@robot   (or run on the robot as root)"
+case "$TARGET" in
+  -*) die "refusing a target that looks like an ssh option: $TARGET" ;;
+  *[!A-Za-z0-9@._:-]*) die "refusing an unexpected target (allowed: user@host, letters/digits/._:-): $TARGET" ;;
+esac
+case "$PORT" in
+  ''|*[!0-9]*) die "AGILEX_PORT/AGILEX_REMOTE_PORT must be numeric: $PORT" ;;
+esac
+for f in ssh scp tar curl; do
+  command -v "$f" >/dev/null || die "$f not found on this laptop"
+done
+
+say "checking the tree for credentials"
+if [ -x "$HERE/scripts/scan-secrets.sh" ]; then
+  "$HERE/scripts/scan-secrets.sh" --root "$HERE" >&2 || die "refusing to package a tree with credentials (see above)"
+else
+  die "scripts/scan-secrets.sh missing"
+fi
 
 say "packaging $HERE"
-TARBALL="$(mktemp -t agilex-remote).tar.gz"
+umask 077
+LOCAL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agilex-remote.XXXXXX")" || die "cannot create a local temp directory"
+trap 'rm -rf "$LOCAL_TMP"' EXIT HUP INT TERM
+TARBALL="$LOCAL_TMP/bundle.tar.gz"
 tar -czf "$TARBALL" -C "$(dirname "$HERE")" \
     --exclude='.git' --exclude='.venv*' --exclude='__pycache__' \
-    --exclude='*.pyc' "$(basename "$HERE")"
+    --exclude='*.pyc' --exclude='*.pem' --exclude='*.key' \
+    --exclude='*password*' --exclude='client.env' \
+    --exclude='windows-client' --exclude='test-server-offline.py' \
+    "$(basename "$HERE")"
 
 say "uploading to $TARGET"
-scp -q "$TARBALL" "$TARGET:/tmp/agilex-remote-bundle.tar.gz"
+STAGE="$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$TARGET" 'mktemp -d /tmp/agilex-remote.XXXXXX')" \
+  || die "cannot create a staging directory on $TARGET"
+case "$STAGE" in
+  /tmp/agilex-remote.*) ;;
+  *) die "refusing an unexpected remote staging path: $STAGE" ;;
+esac
+case "$STAGE" in
+  *[!A-Za-z0-9._/-]*) die "refusing a staging path with shell metacharacters: $STAGE" ;;
+esac
 REMOTE_DIR="$(basename "$HERE")"
+case "$REMOTE_DIR" in
+  *"'"*|*$'\n'*|*$'\r'*) die "refusing a local directory name with quotes/newlines: $REMOTE_DIR" ;;
+esac
+
+cleanup() {
+  rm -rf "$LOCAL_TMP"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" "rm -rf '$STAGE'" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+scp -q -o BatchMode=yes -o ConnectTimeout=20 "$TARBALL" "$TARGET:$STAGE/bundle.tar.gz"
 
 say "installing (sudo on the robot)"
 ssh -t "$TARGET" "set -e
-  rm -rf /tmp/agilex-remote-bundle && mkdir -p /tmp/agilex-remote-bundle
-  tar -xzf /tmp/agilex-remote-bundle.tar.gz -C /tmp/agilex-remote-bundle
-  cd /tmp/agilex-remote-bundle/$REMOTE_DIR
+  tar -xzf '$STAGE/bundle.tar.gz' -C '$STAGE'
+  cd '$STAGE/$REMOTE_DIR'
   sudo ./install.sh"
 
 rm -f "$TARBALL"
 say "verifying through an SSH tunnel"
 ssh -N -L "$PORT:127.0.0.1:$PORT" "$TARGET" &
 TUNNEL=$!
-trap 'kill $TUNNEL 2>/dev/null || true' EXIT
+trap 'kill $TUNNEL 2>/dev/null || true; cleanup' EXIT HUP INT TERM
 sleep 2
 if curl -fsS --max-time 6 "http://127.0.0.1:$PORT/api/status" >/dev/null; then
   echo "  OK - open http://127.0.0.1:$PORT/"
-  echo "  guide: $HERE/INSTALL-CONNECT.md"
+  echo "  guide: $HERE/../01-使用指南/INSTALL-CONNECT.md"
 else
   echo "  could not reach the API through the tunnel; check: journalctl -u agilex-remote"
+  exit 1
 fi

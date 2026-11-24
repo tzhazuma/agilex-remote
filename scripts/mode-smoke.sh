@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 # On-hardware plumbing test for the new operating modes.
 #
-# SAFETY: deliberately does NOT switch to MIT or start drag-teach while the arms
-# are enabled - both make a Piper compliant, i.e. gravity takes over, and this
-# test must never be the reason the arm moves. Those paths are covered by
-# tools/test-modes-offline.py against a fake interface. What is tested here is
-# the HTTP plumbing, the mode round-trip through MOVE P (which holds the same
-# target), and a trajectory whose points equal the measured pose (no motion).
+# ⚠️ THIS IS NOT A NO-MOTION TEST. MOVE P lets the arm plan its own path, and
+# replaying even a "same pose" trajectory can produce a small correction. The
+# test is intended for a clear workspace with an operator on the E-stop.
+#
+# SAFETY: it deliberately does NOT switch to MIT or start drag-teach while the
+# arms are enabled - both make a Piper compliant, i.e. gravity takes over.
+# Those paths are covered by tools/test-modes-offline.py against a fake
+# interface, and MIT is behind a separate opt-in in verify-modes.sh.
+#
+# Requires an explicit opt-in:
+#     AGILEX_ALLOW_MODE_TESTS=1 ./scripts/mode-smoke.sh
 set -euo pipefail
+
+if [ "${AGILEX_ALLOW_MODE_TESTS:-0}" != "1" ]; then
+  cat >&2 <<'EOF'
+REFUSING TO RUN: this test switches to MOVE P and replays a trajectory.
+
+  clear the workspace, put a hand on the E-stop, then re-run with:
+      AGILEX_ALLOW_MODE_TESTS=1 ./scripts/mode-smoke.sh
+EOF
+  exit 2
+fi
+
 python3 - <<'PY'
 import json, time, urllib.request
 

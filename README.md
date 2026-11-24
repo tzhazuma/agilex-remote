@@ -237,12 +237,17 @@ All limits are environment variables — see the table below.
 # x11vnc is optional but recommended for a real desktop view
 sudo apt-get install -y x11vnc can-utils ethtool ffmpeg
 
-sudo install -d /usr/local/share/agilex-remote
-sudo install -m 0755 server/agilex-remote-server.py /usr/local/share/agilex-remote/
-sudo install -m 0644 server/remote-ui.html          /usr/local/share/agilex-remote/
-sudo install -m 0644 server/install-server.sh       /tmp/
-sudo bash /tmp/install-server.sh      # or just copy the unit from that script
+# from the checkout, on the robot:
+sudo ./install.sh
+# or, equivalently:
+sudo ./server/install-server.sh
 ```
+
+`install-server.sh` installs both server files itself; you do not need to copy
+them to `/usr/local/share` or `/tmp` first. If the files live elsewhere, point
+`AGILEX_PAYLOAD` at the directory that contains `agilex-remote-server.py` and
+`remote-ui.html`. The web password is prompted (or read from
+`AGILEX_PASSWORD` / `AGILEX_PASSWORD_FILE`); there is no default.
 
 The chassis needs `tracer_base` running to bridge `/cmd_vel` onto CAN:
 
@@ -258,8 +263,8 @@ ros2 launch tracer_base tracer_base.launch.py
 
 ### Client
 
-Open `http://<robot-ip>:8765/`. Off-loopback clients get a password sign-in page
-(default password `changeme` — **change it**, see `AGILEX_PASSWORD`).
+Open `http://<robot-ip>:8765/`. Off-loopback clients get a password sign-in page;
+the password is chosen at install time (there is no default, see `AGILEX_PASSWORD`).
 
 Loopback is exempt, so `ssh -L 8765:127.0.0.1:8765 robot` skips the login.
 
@@ -306,7 +311,7 @@ to `ssh`, so `ssh robot` keeps working across reboots.
 |---|---|---|
 | `AGILEX_REMOTE_HOST` | `0.0.0.0` | Bind address |
 | `AGILEX_REMOTE_PORT` | `8765` | Port |
-| `AGILEX_PASSWORD` | `changeme` | Sign-in password for off-loopback clients |
+| `AGILEX_PASSWORD` | *(unset)* | Sign-in password for off-loopback clients; the installer requires one (min 8 chars) |
 | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | `2.3` / `0.7853` | Hard clamp |
 | `AGILEX_DEFAULT_LIN` / `AGILEX_DEFAULT_ANG` | `0.5` / `0.3` | UI slider start |
 | `AGILEX_WATCHDOG_MS` | `300` | Stop-if-silent window (= braking distance) |
@@ -400,7 +405,7 @@ in order, first hit wins:
 4. **mDNS** `agilex.local`.
 5. **Sequential sweep**, known /24s first, 600 s budget, one sweep at a time,
    every candidate validated by SSH banner + host key. **Set your own subnet:**
-   `export AGILEX_SCAN_RANGE=10.0.0.0/16` — the shipped default is a placeholder.
+   `export AGILEX_SCAN_RANGE=<ip>/16` — the shipped default is a placeholder.
 
 Set the topic once: `echo '<your-topic>' > ~/.config/agilex/ntfy-topic`.
 
@@ -414,17 +419,23 @@ Set the topic once: `echo '<your-topic>' > ~/.config/agilex/ntfy-topic`.
 sudo ./install.sh
 ```
 
-Then open `http://<robot-ip>:8765/`. The web UI password comes from
-`/etc/agilex-remote.env` (`AGILEX_PASSWORD=...`, mode 0600). **The default is
-`changeme` — change it.**
+Then open `http://<robot-ip>:8765/`. The web UI password is chosen at install
+time and stored in `/etc/agilex-remote.env` (`AGILEX_PASSWORD=...`, mode 0600).
+There is **no default**; the installer refuses to run without a real password
+(8+ chars, not `changeme`). Rotate it with:
+
+```bash
+sudo AGILEX_PASSWORD='<new-password>' ./server/install-server.sh --env-only
+sudo systemctl restart agilex-remote
+```
 
 ## Configuration
 
 | Setting | Where | Default |
 |---|---|---|
-| Web UI password | `/etc/agilex-remote.env` → `AGILEX_PASSWORD` | `changeme` |
+| Web UI password | `/etc/agilex-remote.env` → `AGILEX_PASSWORD` | *(unset; installer requires one)* |
 | Listen address / port | unit env `AGILEX_REMOTE_HOST`, code `PORT` | `0.0.0.0:8765` |
-| Chassis speed cap | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | 2.3 m/s, 1.2 rad/s |
+| Chassis speed cap | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | 2.3 m/s, 0.7853 rad/s |
 | Arm speed | `AGILEX_ARM_SPEED_PCT` | 25 % |
 | Max target lag | `AGILEX_MAX_TARGET_LAG` | 15° |
 | Resync tolerance | `AGILEX_RESYNC_MARGIN` | 5° |
@@ -434,10 +445,20 @@ Then open `http://<robot-ip>:8765/`. The web UI password comes from
 
 ```bash
 python3 tools/test-modes-offline.py     # 41 assertions, fake CAN, no hardware
-./scripts/verify-modes.sh               # 12 checks on the robot, no motion
-./scripts/mode-smoke.sh                 # 23 checks on the robot, no motion
+./scripts/verify-modes.sh               # hardware read-back; NOT motion-free (see gate)
+./scripts/mode-smoke.sh                 # MOVE P + trajectory replay; NOT motion-free
 ./scripts/verify-bundle.sh <zip>        # prove the SHIPPED tree works, from a clean extract
 ```
+
+On Windows use `python` instead of `python3` (the Store `python3` stub may not run);
+`verify-bundle.sh` probes both and falls back automatically.
+
+The two on-robot scripts change arm modes and are **not** "no motion" tests:
+`verify-modes.sh` can switch to MOVE P (and to MIT with a second opt-in), and
+`mode-smoke.sh` replays a trajectory. Both refuse to start unless you clear the
+workspace and set `AGILEX_ALLOW_MODE_TESTS=1`. MIT additionally needs
+`AGILEX_ALLOW_MIT_TEST=1` and is refused while an arm is enabled unless
+`AGILEX_ALLOW_MIT_WHILE_ENABLED=1` is set.
 
 `verify-bundle.sh` exists because a stale copy of the test file was once copied
 over the fixed one, silently dropping the regression tests while the bundle

@@ -5,13 +5,13 @@
 # It shares the desktop the robot is ALREADY logged into — not a new virtual
 # one — so it shows exactly what is on the robot's own monitor.
 #
-#   ./bin/robot-vnc.sh            # ensure the tunnel is up, launch VNC Viewer
-#   ./bin/robot-vnc.sh --status   # report every link in the chain
-#   ./bin/robot-vnc.sh --probe    # end-to-end RFB handshake only
-#   ./bin/robot-vnc.sh --restart  # bounce the SSH tunnel
-#   ./bin/robot-vnc.sh --stop     # tear the tunnel down (and keep it down)
+#   ./scripts/robot-vnc.sh            # ensure the tunnel is up, launch VNC Viewer
+#   ./scripts/robot-vnc.sh --status   # report every link in the chain
+#   ./scripts/robot-vnc.sh --probe    # end-to-end RFB handshake only
+#   ./scripts/robot-vnc.sh --restart  # bounce the SSH tunnel
+#   ./scripts/robot-vnc.sh --stop     # tear the tunnel down (and keep it down)
 #
-# Then in VNC Viewer:  Address  localhost:5900     Password  changeme
+# Then in VNC Viewer:  Address  localhost:5900     Password  the one you set on the robot
 #
 # WHY A TUNNEL: the robot's IP changes on every reboot (eduroam DHCP), so a VNC
 # client pointed at a fixed address would rot. Going through the "agilex" SSH
@@ -33,7 +33,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_PORT="${AGILEX_VNC_LOCAL_PORT:-5900}"
 REMOTE_PORT="${AGILEX_VNC_REMOTE_PORT:-5900}"
 SSH_ALIAS="${AGILEX_SSH_ALIAS:-agilex}"
-VNC_PW="${AGILEX_VNC_PASSWORD:-changeme}"
+VNC_PW="${AGILEX_VNC_PASSWORD:-}"
 VNC_APP="${AGILEX_VNC_APP:-/Applications/VNC Viewer.app}"
 LABEL="com.example.agilex-vnc-tunnel"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -43,17 +43,32 @@ if [ -x /usr/bin/python3 ]; then PYBIN=/usr/bin/python3; else PYBIN=python3; fi
 
 tunnel_up()    { lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; }
 agent_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
-robot()        { "$DIR/rrun.sh" -c "$1" 2>/dev/null; }
+robot()        { ssh -o BatchMode=yes -o ConnectTimeout=20 "$SSH_ALIAS" "$1" 2>/dev/null; }
 robot_ip()     { robot 'hostname -I' | awk '{print $1}'; }
+
+need_pw() {
+  [ -n "$VNC_PW" ] && return 0
+  if [ -t 0 ]; then
+    printf 'VNC password for the robot: ' >&2
+    IFS= read -r -s VNC_PW
+    printf '\n' >&2
+  else
+    echo "VNC password not set: export AGILEX_VNC_PASSWORD or run with a TTY" >&2
+    exit 3
+  fi
+  [ -n "$VNC_PW" ] || { echo "empty VNC password" >&2; exit 3; }
+}
 
 # Full RFB handshake against 127.0.0.1:$LOCAL_PORT: banner, security types, DES
 # challenge/response with the real password, and the ServerInit that reports the
 # desktop size. This proves the whole chain (tunnel -> x11vnc -> display :0 ->
 # password file), not merely that a port is open.
 rfb_probe() {
-  "$PYBIN" - "$LOCAL_PORT" "$VNC_PW" <<'PY'
-import socket, struct, subprocess, sys
-port, pw = int(sys.argv[1]), sys.argv[2]
+  need_pw
+  VNC_PW="$VNC_PW" "$PYBIN" - "$LOCAL_PORT" <<'PY'
+import os, socket, struct, subprocess, sys
+port = int(sys.argv[1])
+pw = os.environ["VNC_PW"]
 def rd(s, n):
     b = b""
     while len(b) < n:
@@ -101,7 +116,7 @@ PY
 status() {
   printf 'robot reachable  : '
   ip="$(robot_ip)"
-  if [ -n "$ip" ]; then echo "yes ($ip)"; else echo "NO (try ./bin/find-robot.sh)"; fi
+  if [ -n "$ip" ]; then echo "yes ($ip)"; else echo "NO (try ./scripts/find-robot.sh)"; fi
 
   printf 'launchd agent    : '
   if agent_loaded; then echo "loaded ($LABEL)"; else echo "NOT loaded"; fi
@@ -122,7 +137,11 @@ status() {
 
   if tunnel_up; then
     echo 'end-to-end RFB   :'
-    rfb_probe || echo "  (chain is broken - see reports/vnc.md)"
+    if [ -n "$VNC_PW" ]; then
+      rfb_probe || echo "  (chain is broken - see reports/vnc.md)"
+    else
+      echo "  skip auth probe (set AGILEX_VNC_PASSWORD to include it)"
+    fi
   else
     echo 'end-to-end RFB   : skipped (no tunnel)'
   fi
@@ -153,13 +172,13 @@ stop() {
     echo "$LABEL was not loaded"
   fi
   pkill -f "ssh .*-L $LOCAL_PORT:127.0.0.1:$REMOTE_PORT" 2>/dev/null && echo "stopped a stray tunnel"
-  echo "tunnel down. (./bin/robot-vnc.sh brings it back; it also returns at next login"
+  echo "tunnel down. (./scripts/robot-vnc.sh brings it back; it also returns at next login"
   echo " unless you remove $PLIST.)"
 }
 
 case "${1:-}" in
   --status)  status; exit 0 ;;
-  --probe)   rfb_probe; exit $? ;;
+  --probe)   need_pw; rfb_probe; exit $? ;;
   --restart) launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null && echo "tunnel restarted." || echo "could not restart $LABEL" >&2; exit 0 ;;
   --stop)    stop; exit 0 ;;
   -h|--help) sed -n '2,/^# --- end of help ---$/p' "$0"; exit 0 ;;
@@ -168,7 +187,7 @@ esac
 echo "### 1. robot reachable? ###"
 if ! robot 'echo ok' | grep -q ok; then
   echo "ABORT: cannot reach the robot (alias '$SSH_ALIAS')." >&2
-  echo "       try: ./bin/find-robot.sh" >&2
+  echo "       try: ./scripts/find-robot.sh" >&2
   exit 1
 fi
 echo "yes ($(robot_ip))."
@@ -178,18 +197,22 @@ if ensure_tunnel; then
   echo "up."
 else
   echo "ABORT: nothing listening on 127.0.0.1:$LOCAL_PORT." >&2
-  echo "       ./bin/robot-vnc.sh --stop   then retry" >&2
+  echo "       ./scripts/robot-vnc.sh --stop   then retry" >&2
   exit 1
 fi
 
 echo "### 3. end-to-end VNC check ###"
-rfb_probe || echo "  (the tunnel is up but the handshake failed - see reports/vnc.md)"
+if [ -n "$VNC_PW" ]; then
+  rfb_probe || echo "  (the tunnel is up but the handshake failed - see reports/vnc.md)"
+else
+  echo "  skip auth probe (set AGILEX_VNC_PASSWORD to include it)"
+fi
 
 echo "### 4. robot-side service ###"
 svc="$(robot 'systemctl is-active x11vnc.service')"
 echo "x11vnc.service is ${svc:-unknown}."
 if [ "$svc" != "active" ]; then
-  echo "  fix with: ./bin/rsudo.sh -c 'systemctl restart x11vnc.service'"
+  echo "  fix with: ./scripts/rsudo.sh -c 'systemctl restart x11vnc.service'"
 fi
 
 echo "### 5. launch VNC Viewer ###"
@@ -204,13 +227,13 @@ cat <<EOF
 ------------------------------------------------------------------
  In VNC Viewer, connect to:
      Address  : localhost:$LOCAL_PORT
-     Password : $VNC_PW
+     Password : the one you set on the robot (not printed here)
  (RealVNC Viewer does not register the vnc:// URL scheme, so type the
   address once and let it save the connection.)
 
  The tunnel stays up on its own (launchd KeepAlive); check it any time:
-     ./bin/robot-vnc.sh --status
+     ./scripts/robot-vnc.sh --status
  Stop it with:
-     ./bin/robot-vnc.sh --stop
+     ./scripts/robot-vnc.sh --stop
 ------------------------------------------------------------------
 EOF

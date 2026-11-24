@@ -73,6 +73,12 @@ spec = importlib.util.spec_from_file_location("srv", SERVER)
 srv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(srv)
 
+# These tests exercise the MOVE C frame sequence itself. MOVE C is disabled by
+# default in production (AGILEX_ENABLE_MOVEC=0); enable it here so the encoding
+# tests can run. The default-off guard has its own tests in
+# tools/test-server-offline.py.
+srv.ENABLE_MOVEC = True
+
 FAIL = []
 
 
