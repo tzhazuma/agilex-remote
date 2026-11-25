@@ -23,7 +23,7 @@ to any AgileX + Piper build.
 | **Chassis drive** | Keyboard (WASD/arrows), mouse D-pad, on-screen joystick, or a physical gamepad |
 | **Dual arms** | Per-arm panels: incremental nudge, **absolute target angles**, gripper, enable/disable, per-joint fault display |
 | **3D view** | Hand-rolled forward-kinematics stick model of each arm, driven by the live joint angles, with the commanded target ghosted in amber |
-| **Cameras** | Two live MJPEG streams (one per arm), streamed straight from V4L2 with no re-encode |
+| **Cameras** | Two wrist MJPEG streams plus optional global BRIO (`cam=4`) through a shared HTTP frame hub |
 | **Safety** | Hard server-side clamps, a watchdog that forces a stop, E-STOP, and a fault-clearing reset |
 | **Discovery** | The robot publishes its own DHCP address to an ntfy topic, so a client finds it after a reboot without scanning |
 | **Android** | A thin WebView shell (`android/`) with a launcher icon, ntfy auto-discovery, and a configurable base URL |
@@ -69,8 +69,9 @@ Each episode becomes a self-contained directory:
 ```
 episode_0007/
     meta.json          task, timing, frame count, outcome, camera warm-up state
-    cam0/000001.jpg    left arm camera
-    cam2/000001.jpg    right arm camera
+    cam0/000001.jpg    right wrist camera
+    cam2/000001.jpg    left wrist camera
+    cam4/000001.jpg    optional global Logitech BRIO
     timeline.csv       one row per tick
 ```
 
@@ -220,6 +221,8 @@ whole watchdog window before a stop is even commanded:
 ```
 coast = watchdog_ms / 1000 * speed
 ```
+
+A single `/api/drive` POST is not a duration-controlled move: it only refreshes the target until the watchdog expires. For a sustained move, continuously re-post the command (and lease heartbeat) faster than `WATCHDOG_MS`, then explicitly send zero. At `0.03 m/s`, one isolated request can expire after roughly 9 mm even if the client sleeps for 0.2 s; this made earlier tests look like the chassis had not moved. A successful HTTP response alone is not motion evidence—verify fresh images or calibrated wheel counts.
 
 At the original 0.08 m/s cap a 700 ms window was 5.6 cm and irrelevant. At
 2.3 m/s it would be **1.6 m**. The default is therefore 300 ms (0.69 m at full
@@ -441,6 +444,7 @@ to `ssh`, so `ssh robot` keeps working across reboots.
 | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | `2.3` / `0.7853` | Hard clamp |
 | `AGILEX_DEFAULT_LIN` / `AGILEX_DEFAULT_ANG` | `0.5` / `0.3` | UI slider start |
 | `AGILEX_WATCHDOG_MS` | `300` | Stop-if-silent window (= braking distance) |
+| `AGILEX_BRIO_FRAME_URL` | *(unset)* | Optional shared global JPEG endpoint; enables `/frame|video?cam=4` and `cam4` recording without reopening V4L2 |
 | `AGILEX_MAX_JOINT_STEP` | `2.0` | Max degrees per nudge |
 | `AGILEX_ARM_SPEED_PCT` | `25` | Piper `move_spd_rate_ctrl` |
 | `AGILEX_ARM_CAN` / `AGILEX_ARM_CAN_RIGHT` | `can_left` / `can_right` | Arm buses |

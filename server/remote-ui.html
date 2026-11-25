@@ -30,7 +30,7 @@
                               THIS MOVES THE ARM - gated behind an inline confirm.
     POST /api/estop           (no body) -> disables BOTH arms
     POST /api/estop/clear     (no body)
-    GET  /video?cam=0 (LEFT ARM CAMERA) and /video?cam=2 (RIGHT ARM CAMERA) as <img> MJPEG
+    GET  /video?cam=0 (RIGHT), /video?cam=2 (LEFT), /video?cam=4 (GLOBAL BRIO) as <img> MJPEG
 
   TWO ARMS: `arm` is 0 = LEFT (can_left, the default) and 1 = RIGHT (can_right).
   Omitting the field is still valid and means the left arm, exactly as before, so
@@ -447,30 +447,43 @@
 
     <div class="cam primary">
       <div class="cam-head">
-        <span class="cam-title">LEFT ARM CAMERA</span>
+        <span class="cam-title">RIGHT ARM CAMERA</span>
         <span class="cam-sub">/video?cam=0</span>
         <span class="grow"></span>
         <button class="mini" data-reconnect="0">Reconnect</button>
       </div>
       <div class="cam-body">
-        <img id="camImg0" alt="Live view from the left arm camera" decoding="async">
+        <img id="camImg0" alt="Live view from the right arm camera" decoding="async">
         <div class="nosignal" id="camNs0">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
       </div>
     </div>
 
     <div class="cam primary">
       <div class="cam-head">
-        <span class="cam-title">RIGHT ARM CAMERA</span>
+        <span class="cam-title">LEFT ARM CAMERA</span>
         <span class="cam-sub">/video?cam=2</span>
         <span class="grow"></span>
         <button class="mini" data-reconnect="2">Reconnect</button>
       </div>
       <div class="cam-body">
-        <img id="camImg2" alt="Live view from the right arm camera" decoding="async">
+        <img id="camImg2" alt="Live view from the left arm camera" decoding="async">
         <div class="nosignal" id="camNs2">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
       </div>
     </div>
-    <div class="hint">Both cameras are mounted on the arms. Android Chrome sometimes drops long-lived MJPEG streams &mdash; use Reconnect.</div>
+
+    <div class="cam primary">
+      <div class="cam-head">
+        <span class="cam-title">GLOBAL / LOGITECH BRIO</span>
+        <span class="cam-sub">/video?cam=4</span>
+        <span class="grow"></span>
+        <button class="mini" data-reconnect="4">Reconnect</button>
+      </div>
+      <div class="cam-body">
+        <img id="camImg4" alt="Live global view from the Logitech BRIO camera" decoding="async">
+        <div class="nosignal" id="camNs4">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
+      </div>
+    </div>
+    <div class="hint">Wrist cameras are mounted on the arms; BRIO provides the global view. Android Chrome sometimes drops long-lived MJPEG streams &mdash; use Reconnect.</div>
   </section>
 
   <!-- ============ ARMS (both) ============ -->
@@ -2299,7 +2312,8 @@
      ===================================================================== */
   var CAMERAS = [
     { cam: 0, img: 'camImg0', ns: 'camNs0' },
-    { cam: 2, img: 'camImg2', ns: 'camNs2' }
+    { cam: 2, img: 'camImg2', ns: 'camNs2' },
+    { cam: 4, img: 'camImg4', ns: 'camNs4' }
   ];
   var camState = {};
   function camUrl(cam) { return '/video?cam=' + cam; }

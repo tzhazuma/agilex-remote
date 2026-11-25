@@ -44,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ----------------------------------------------------------------------------
@@ -529,7 +530,11 @@ CMD_VEL_TOPIC = os.environ.get("AGILEX_CMD_VEL_TOPIC", "/cmd_vel")
 ODOM_TOPIC = os.environ.get("AGILEX_ODOM_TOPIC", "/odom")
 STATUS_TOPIC = os.environ.get("AGILEX_STATUS_TOPIC", "/tracer_status")
 
-VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}   # 0 = faces the ARM, 2 = faces the FLOOR
+VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}
+BRIO_FRAME_URL = os.environ.get("AGILEX_BRIO_FRAME_URL", "").strip()
+if BRIO_FRAME_URL:
+    VIDEO_DEV[4] = BRIO_FRAME_URL
+CAMERA_META = {"cam0": "right wrist", "cam2": "left wrist", "cam4": "global Logitech BRIO"}
 VIDEO_W, VIDEO_H, VIDEO_FPS = 640, 480, 12
 # The rate we ask the CAMERA for. Must be requested at the input (-framerate),
 # not only on the output: otherwise the device negotiates its maximum mode and
@@ -2046,7 +2051,7 @@ FRAME_TIMEOUT_S = 8.0
 FRAME_HOLD_S = float(os.environ.get("AGILEX_FRAME_HOLD", "30"))
 
 # A camera that has just been opened can take much longer than FRAME_TIMEOUT_S
-# to deliver its first frame. Measured on this robot: cam2 (right arm) needs
+# to deliver its first frame. Measured on this robot: cam2 (left arm) needs
 # around 9 seconds to cold-start, especially when the other camera is opening at
 # the same moment on the same USB bus. Using the steady-state timeout for the
 # FIRST frame made a fresh viewer give up before the camera was ready, which
@@ -2304,6 +2309,58 @@ class FrameHub:
         log(f"hub {self.dev}: stopped")
 
 
+class HttpFrameHub(FrameHub):
+    """Share a loopback JPEG endpoint without opening the V4L2 device twice."""
+
+    def __init__(self, url, poll_hz=12, timeout=2.0):
+        super().__init__(url)
+        self.period = 1.0 / max(1.0, float(poll_hz))
+        self.timeout = float(timeout)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _pump(self):
+        while not self._stop.is_set():
+            with self._cond:
+                while self._refs == 0 and not self._stop.is_set():
+                    self._cond.wait(0.5)
+                if self._stop.is_set():
+                    return
+            n = 0
+            t0 = time.monotonic()
+            try:
+                while self._refs and not self._stop.is_set():
+                    try:
+                        with self._opener.open(self.dev, timeout=self.timeout) as response:
+                            jpg = response.read()
+                        if not (jpg.startswith(b"\xff\xd8") and jpg.endswith(b"\xff\xd9")):
+                            raise ValueError("invalid JPEG from global camera")
+                        with self._cond:
+                            if jpg != self._latest:
+                                n += 1
+                                self._latest = jpg
+                                self._seq += 1
+                                elapsed = time.monotonic() - t0
+                                if elapsed > 0:
+                                    self.fps = n / elapsed
+                                self._cond.notify_all()
+                            self._err = None
+                    except Exception as e:
+                        self._err = repr(e)
+                    with self._cond:
+                        if self._refs == 0:
+                            self._latest = None
+                            self._seq = 0
+                            self._cond.notify_all()
+                    time.sleep(self.period)
+            finally:
+                with self._cond:
+                    if self._refs == 0:
+                        self._latest = None
+                        self._seq = 0
+                        self._cond.notify_all()
+            time.sleep(0.4)
+
+
 # ----------------------------------------------------------------------------
 # Shared control state
 # ----------------------------------------------------------------------------
@@ -2507,12 +2564,13 @@ class EpisodeRecorder:
     Layout, one directory per episode:
         episode_0001/
             meta.json      task, notes, timing, outcome, counts
-            cam0/000001.jpg ...   left arm camera
-            cam2/000001.jpg ...   right arm camera
+            cam0/000001.jpg ...   right wrist camera
+            cam2/000001.jpg ...   left wrist camera
+            cam4/000001.jpg ...   optional global Logitech BRIO
             timeline.csv   one row per tick: t, frame, joint angles, gripper,
                            commanded lin/ang, odometry
     File names are deliberately the same tick index, so a row in timeline.csv
-    and the two images with that index are the same moment by construction.
+    and all configured images with that index are the same moment by construction.
     """
 
     def __init__(self, control, hubs, root=EPISODE_ROOT):
@@ -2564,8 +2622,8 @@ class EpisodeRecorder:
                 # Belt and braces: never silently clobber an existing episode.
                 return {"ok": False, "error": f"{ep} already exists and is not empty"}
             try:
-                for sub in ("cam0", "cam2"):
-                    os.makedirs(os.path.join(ep, sub), exist_ok=True)
+                for cam in self.hubs:
+                    os.makedirs(os.path.join(ep, f"cam{cam}"), exist_ok=True)
             except Exception as e:
                 return {"ok": False, "error": f"cannot create {ep}: {e}"}
 
@@ -2576,7 +2634,8 @@ class EpisodeRecorder:
                 "notes": notes,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "record_hz": RECORD_HZ,
-                "cameras": {"cam0": "left arm", "cam2": "right arm"},
+                "cameras": {f"cam{cam}": CAMERA_META.get(f"cam{cam}", f"camera {cam}")
+                            for cam in self.hubs},
                 "frames": 0,
                 "duration_s": 0.0,
                 "success": None,
@@ -2676,7 +2735,7 @@ class EpisodeRecorder:
             header += ["cmd_lin", "cmd_ang", "odom_x", "odom_y", "battery_v"]
             # Source frame counters, so a consumer can tell a genuinely new
             # camera frame from a repeated one (see the image block below).
-            header += ["cam0_seq", "cam2_seq"]
+            header += [f"cam{cam}_seq" for cam in self.hubs]
             w.writerow(header)
 
             nxt = t_start
@@ -2695,13 +2754,14 @@ class EpisodeRecorder:
                 t = time.time() - t_start
 
                 # Images: the hub holds the newest frame, which is fine at 10 Hz
-                # against a 28 Hz source. ALWAYS write both cameras, repeating the
+                # against a 28 Hz source. ALWAYS write every configured camera, repeating the
                 # previous frame if the source has not advanced - otherwise the
                 # episode is ragged (cam2 could miss 90 of 122 frames) and every
                 # consumer downstream has to handle holes. The cam*_seq columns
                 # record whether the frame was actually new.
                 seqs = {}
-                for cam, sub in ((0, "cam0"), (2, "cam2")):
+                for cam in self.hubs:
+                    sub = f"cam{cam}"
                     hub = self.hubs.get(cam)
                     jpg = hub.snapshot() if hub else None
                     seq = hub.seq_now() if hub else 0
@@ -2739,8 +2799,8 @@ class EpisodeRecorder:
                         round(float(ch.get("ang_z") or 0.0), 4),
                         round(float(ch.get("odom_x") or 0.0), 4),
                         round(float(ch.get("odom_y") or 0.0), 4),
-                        ch.get("battery_v"),
-                        seqs.get(0, 0), seqs.get(2, 0)]
+                        ch.get("battery_v")]
+                row += [seqs.get(cam, 0) for cam in self.hubs]
                 try:
                     w.writerow(row)
                 except Exception as e:
@@ -3046,7 +3106,8 @@ class Handler(BaseHTTPRequestHandler):
             cam = int(m.group(1)) if m else 0
             dev = VIDEO_DEV.get(cam)
             hub = self.hubs.get(cam)
-            if not dev or not hub or not os.path.exists(dev):
+            missing_local = not dev.startswith(("http://", "https://")) and not os.path.exists(dev)
+            if not dev or not hub or missing_local:
                 self._json({"ok": False, "error": f"camera {cam} ({dev}) not present"}, 503)
                 return
             self.send_response(200)
@@ -3469,7 +3530,8 @@ def main():
     # One frame hub per camera. Both the live MJPEG view and the episode
     # recorder read from these, because a V4L2 device cannot be opened twice -
     # verified: a second ffmpeg gets "Device or resource busy".
-    hubs = {cam: FrameHub(dev) for cam, dev in VIDEO_DEV.items()}
+    hubs = {cam: (HttpFrameHub(dev) if dev.startswith(("http://", "https://")) else FrameHub(dev))
+            for cam, dev in VIDEO_DEV.items()}
     Handler.hubs = hubs
     Handler.recorder = EpisodeRecorder(ctl, hubs)
     log(f"recorder ready: root={EPISODE_ROOT} at {RECORD_HZ:g} Hz")

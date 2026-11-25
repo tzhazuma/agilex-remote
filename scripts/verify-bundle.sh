@@ -106,7 +106,7 @@ for f in server/agilex-remote-server.py server/remote-ui.html server/install-ser
          install.sh scripts/rsudo.sh scripts/agilex-lib.sh scripts/agilex-lease.sh \
          scripts/scan-secrets.sh scripts/verify-bundle.sh scripts/test-deploy-offline.sh \
          scripts/test-lease-offline.py tools/test-modes-offline.py \
-         tools/test-server-offline.py tools/test-feedback-control.py; do
+         tools/test-server-offline.py tools/test-feedback-control.py tools/test-http-frame-hub.py; do
   if [ -f "$WORK/$f" ]; then ok "$f present"; else bad "$f missing"; fi
 done
 [ -x "$WORK/install.sh" ] && ok "install.sh executable" || bad "install.sh not executable"
@@ -123,7 +123,7 @@ else
 fi
 
 echo
-echo "== shipped test suites (all four must pass; PASS floors catch deletions) =="
+echo "== shipped test suites (all five must pass; PASS floors catch deletions) =="
 # Test-only switch used by test-deploy's meta-tests. Never set it for a release.
 if [ "${AGILEX_VERIFY_SKIP_SUITES:-0}" = "1" ]; then
   echo "  NOTE: suite gate skipped by AGILEX_VERIFY_SKIP_SUITES=1"
@@ -131,6 +131,7 @@ else
   run_suite "mode"     "tools/test-modes-offline.py"    41
   run_suite "server"   "tools/test-server-offline.py"   148
   run_suite "feedback" "tools/test-feedback-control.py" 272
+  run_suite "http_hub" "tools/test-http-frame-hub.py"  3
   run_suite "lease"    "scripts/test-lease-offline.py"  23
 fi
 
