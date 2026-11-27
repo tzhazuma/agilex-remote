@@ -534,7 +534,11 @@ VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}
 BRIO_FRAME_URL = os.environ.get("AGILEX_BRIO_FRAME_URL", "").strip()
 if BRIO_FRAME_URL:
     VIDEO_DEV[4] = BRIO_FRAME_URL
-CAMERA_META = {"cam0": "right wrist", "cam2": "left wrist", "cam4": "global Logitech BRIO"}
+REALSENSE_RGB_DEV = os.environ.get("AGILEX_REALSENSE_RGB_DEV", "").strip()
+if REALSENSE_RGB_DEV:
+    VIDEO_DEV[12] = REALSENSE_RGB_DEV
+CAMERA_META = {"cam0": "right wrist", "cam2": "left wrist", "cam4": "global Logitech BRIO",
+               "cam12": "global RealSense D455"}
 VIDEO_W, VIDEO_H, VIDEO_FPS = 640, 480, 12
 # The rate we ask the CAMERA for. Must be requested at the input (-framerate),
 # not only on the output: otherwise the device negotiates its maximum mode and
@@ -2032,9 +2036,14 @@ class ArmBridge:
 # MJPEG streaming
 # ----------------------------------------------------------------------------
 def ffmpeg_cmd(dev):
+    input_format = "mjpeg"
+    for cam, configured_dev in VIDEO_DEV.items():
+        if configured_dev == dev:
+            input_format = os.environ.get(f"AGILEX_CAM{cam}_INPUT_FORMAT", "mjpeg")
+            break
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "v4l2", "-input_format", "mjpeg",
+        "-f", "v4l2", "-input_format", input_format,
         "-video_size", f"{VIDEO_W}x{VIDEO_H}",
         # Ask the DEVICE for the low rate, not just the output. Without this the
         # camera runs its maximum mode (30 fps) and reserves USB bandwidth for

@@ -23,7 +23,7 @@ to any AgileX + Piper build.
 | **Chassis drive** | Keyboard (WASD/arrows), mouse D-pad, on-screen joystick, or a physical gamepad |
 | **Dual arms** | Per-arm panels: incremental nudge, **absolute target angles**, gripper, enable/disable, per-joint fault display |
 | **3D view** | Hand-rolled forward-kinematics stick model of each arm, driven by the live joint angles, with the commanded target ghosted in amber |
-| **Cameras** | Two wrist MJPEG streams plus optional global BRIO (`cam=4`) through a shared HTTP frame hub |
+| **Cameras** | Two wrist MJPEG streams plus optional global BRIO (`cam=4`) and RealSense D455 (`cam=12`, YUYV) |
 | **Safety** | Hard server-side clamps, a watchdog that forces a stop, E-STOP, and a fault-clearing reset |
 | **Discovery** | The robot publishes its own DHCP address to an ntfy topic, so a client finds it after a reboot without scanning |
 | **Android** | A thin WebView shell (`android/`) with a launcher icon, ntfy auto-discovery, and a configurable base URL |
@@ -72,6 +72,7 @@ episode_0007/
     cam0/000001.jpg    right wrist camera
     cam2/000001.jpg    left wrist camera
     cam4/000001.jpg    optional global Logitech BRIO
+    cam12/000001.jpg   optional global RealSense D455
     timeline.csv       one row per tick
 ```
 
@@ -445,6 +446,8 @@ to `ssh`, so `ssh robot` keeps working across reboots.
 | `AGILEX_DEFAULT_LIN` / `AGILEX_DEFAULT_ANG` | `0.5` / `0.3` | UI slider start |
 | `AGILEX_WATCHDOG_MS` | `300` | Stop-if-silent window (= braking distance) |
 | `AGILEX_BRIO_FRAME_URL` | *(unset)* | Optional shared global JPEG endpoint; enables `/frame|video?cam=4` and `cam4` recording without reopening V4L2 |
+| `AGILEX_REALSENSE_RGB_DEV` | *(unset)* | Optional D455 RGB device path; enables `cam12` |
+| `AGILEX_CAM12_INPUT_FORMAT` | `mjpeg` | Set `yuyv422` for the D455 RGB node |
 | `AGILEX_MAX_JOINT_STEP` | `2.0` | Max degrees per nudge |
 | `AGILEX_ARM_SPEED_PCT` | `25` | Piper `move_spd_rate_ctrl` |
 | `AGILEX_ARM_CAN` / `AGILEX_ARM_CAN_RIGHT` | `can_left` / `can_right` | Arm buses |

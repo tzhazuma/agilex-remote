@@ -75,6 +75,21 @@ class HttpFrameHubTests(unittest.TestCase):
             source = f.read()
         self.assertIn('f"cam{cam}_seq" for cam in self.hubs', source)
         self.assertIn('"cam4": "global Logitech BRIO"', source)
+    def test_realsense_raw_format_and_ui_are_configurable(self):
+        old_dev = dict(srv.VIDEO_DEV)
+        srv.VIDEO_DEV[12] = "/dev/test-realsense"
+        os.environ["AGILEX_CAM12_INPUT_FORMAT"] = "yuyv422"
+        try:
+            cmd = srv.ffmpeg_cmd("/dev/test-realsense")
+            self.assertEqual(cmd[cmd.index("-input_format") + 1], "yuyv422")
+        finally:
+            srv.VIDEO_DEV.clear()
+            srv.VIDEO_DEV.update(old_dev)
+            os.environ.pop("AGILEX_CAM12_INPUT_FORMAT", None)
+        with open(os.path.join(HERE, "..", "server", "remote-ui.html"), encoding="utf-8") as f:
+            ui = f.read()
+        self.assertIn("REALSENSE D455", ui)
+        self.assertIn("{ cam: 12, img: 'camImg12', ns: 'camNs12' }", ui)
 
 
 if __name__ == "__main__":
@@ -84,4 +99,5 @@ if __name__ == "__main__":
         print("PASS shared HTTP frame acquire/wait/release")
         print("PASS UI exposes global BRIO as cam4")
         print("PASS recorder schema includes global sequence")
+        print("PASS RealSense raw input format and UI are configurable")
     raise SystemExit(0 if result.wasSuccessful() else 1)

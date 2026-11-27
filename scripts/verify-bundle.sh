@@ -131,7 +131,7 @@ else
   run_suite "mode"     "tools/test-modes-offline.py"    41
   run_suite "server"   "tools/test-server-offline.py"   148
   run_suite "feedback" "tools/test-feedback-control.py" 272
-  run_suite "http_hub" "tools/test-http-frame-hub.py"  3
+  run_suite "http_hub" "tools/test-http-frame-hub.py"  4
   run_suite "lease"    "scripts/test-lease-offline.py"  23
 fi
 
