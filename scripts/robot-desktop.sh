@@ -7,9 +7,9 @@
 # tunnel always lands on the right machine. It also means the robot's NoMachine
 # port never has to be exposed to the campus network.
 #
-#   ./bin/robot-desktop.sh            # tunnel + launch NoMachine
-#   ./bin/robot-desktop.sh --status   # just report what is up
-#   ./bin/robot-desktop.sh --stop     # tear the tunnel down
+#   ./scripts/robot-desktop.sh            # tunnel + launch NoMachine
+#   ./scripts/robot-desktop.sh --status   # just report what is up
+#   ./scripts/robot-desktop.sh --stop     # tear the tunnel down
 #
 # Then in NoMachine:  Protocol NX | Host localhost | Port 4400 | User agilex
 #
@@ -64,7 +64,7 @@ esac
 echo "### 1. robot reachable? ###"
 if ! ssh -o BatchMode=yes -o ConnectTimeout=30 "$SSH_ALIAS" 'echo ok' 2>/dev/null | grep -q ok; then
   echo "ABORT: cannot reach the robot." >&2
-  echo "       try: ./bin/find-robot.sh" >&2
+  echo "       try: ./scripts/find-robot.sh" >&2
   exit 1
 fi
 echo "yes ($(robot_ip))."
@@ -80,7 +80,7 @@ else
     pgrep -f "ssh .*-L $LOCAL_PORT:127.0.0.1:$REMOTE_PORT" 2>/dev/null | head -1 > "$TUNNEL_PIDFILE"
   else
     echo "ABORT: could not open the tunnel (is local port $LOCAL_PORT busy?)." >&2
-    echo "       ./bin/robot-desktop.sh --stop   then retry" >&2
+    echo "       ./scripts/robot-desktop.sh --stop   then retry" >&2
     exit 1
   fi
 fi
@@ -92,7 +92,7 @@ if [ -d /Applications/NoMachine.app ]; then
   open -a NoMachine && echo "launched."
 else
   echo "NoMachine.app is not installed - install it with:"
-  echo "    ./bin/install-nomachine-client.sh /tmp/nomachine.dmg"
+  echo "    ./scripts/install-nomachine-client.sh /tmp/nomachine.dmg"
 fi
 
 cat <<EOF
@@ -106,6 +106,6 @@ cat <<EOF
  (the tunnel already authenticated you, so no robot password is needed)
 
  Keep this tunnel alive while you work; stop it with:
-     ./bin/robot-desktop.sh --stop
+     ./scripts/robot-desktop.sh --stop
 ------------------------------------------------------------------
 EOF

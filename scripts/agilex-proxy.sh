@@ -35,13 +35,14 @@ SEEN="$STATE/seen-ips"
 # Prefer ~/.config/agilex/ntfy-topic: this script also runs from a launchd
 # LaunchAgent (the standing NoMachine tunnel), and macOS TCC refuses to execute
 # anything under ~/Documents from a background agent - "Operation not
-# permitted". bin/install-local-helpers.sh puts a copy there.
+# permitted". scripts/install-local-helpers.sh puts a copy there.
 if [ -n "${AGILEX_NTFY_TOPIC_FILE:-}" ]; then
   NTFY_TOPIC_FILE="$AGILEX_NTFY_TOPIC_FILE"
 elif [ -r "$HOME/.config/agilex/ntfy-topic" ]; then
   NTFY_TOPIC_FILE="$HOME/.config/agilex/ntfy-topic"
 else
-  NTFY_TOPIC_FILE="$DIR/../remote/robot-files/agilex-report-ip.topic"
+  # Optional: no topic configured means "skip ntfy", not "fail to start".
+  NTFY_TOPIC_FILE=""
 fi
 mkdir -p "$STATE" 2>/dev/null
 

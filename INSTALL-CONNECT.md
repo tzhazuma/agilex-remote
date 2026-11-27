@@ -53,19 +53,20 @@ ip -details link show can_left | grep -E "state|bitrate"   # 应为 UP / 1000000
 ### 方式 A：从笔记本一键装（推荐）
 
 ```bash
-unzip agilex-remote-2026-10-29.zip
-cd agilex-remote
+unzip <交付包>.zip
+cd 02-代码
 ./install.sh agilex@<机器人地址>
 ```
 
-它会：打包 → scp 上传 → 在机器人上 `sudo` 安装 → 启动服务 → 建一条 SSH 隧道并检查 `/api/status`。
+它会：先扫描包内是否有明文凭据 → 打包 → scp 上传到机器人上的随机 `mktemp` 目录 → 在机器人上 `sudo` 安装 → 启动服务 → 建一条 SSH 隧道并检查 `/api/status` → 删除本地和机器人上的临时目录。
+过程中会提示机器人账户的 sudo 密码和要设置的网页密码；两者都不会从包里读取，也不会写进命令行参数。
 
 ### 方式 B：直接在机器人上装
 
 把包拷到机器人上，然后：
 
 ```bash
-cd agilex-remote
+cd 02-代码
 sudo ./install.sh
 ```
 
@@ -79,15 +80,43 @@ logs:    journalctl -u agilex-remote -f
 
 ### 设置网页密码
 
-安装时如果没设，默认是 **`changeme`**。密码存在：
+**没有默认密码。** 安装器按以下顺序取密码：
+
+1. 环境变量 `AGILEX_PASSWORD`；
+2. 环境变量 `AGILEX_PASSWORD_FILE` 指向的文件（只读第一行，适合自动化）；
+3. 有 TTY 时交互提示。
+
+三者都没有，或密码短于 8 位、等于旧默认值 `changeme`、含空白/引号/反斜杠时，安装器**拒绝安装**。
+密码写在机器人上：
 
 ```
-/etc/agilex-remote.env          # AGILEX_PASSWORD=...
+/etc/agilex-remote.env          # AGILEX_PASSWORD=...，模式 0600
 ```
 
-改完重启：`sudo systemctl restart agilex-remote`。
+> 这个文件是 0600，且作为**强制** `EnvironmentFile` 被 unit 引用；缺失时服务启动失败，
+> 不会悄悄回退到 Python 源码里的占位默认值。`systemctl cat` 看不到密码。
+> 安装器不会把密码写入 unit、命令行参数或 `/tmp`。
 
-> 这个文件是 0600，且不写进 systemd unit，所以 `systemctl cat` 看不到密码。
+轮换密码（不重装）：
+
+```bash
+sudo AGILEX_PASSWORD='<new-password>' ./server/install-server.sh --env-only
+sudo systemctl restart agilex-remote
+```
+
+### 从旧版本升级
+
+旧 unit 可能**没有** `EnvironmentFile`；这时服务会退回 Python 源码里的占位默认密码。
+装完先用这两条确认（不会打印密码）：
+
+```bash
+systemctl show -p EnvironmentFiles agilex-remote     # 必须出现 /etc/agilex-remote.env
+stat -c '%a %U:%G %n' /etc/agilex-remote.env         # 必须是 600 root:root
+```
+
+如果第一条为空或第二条报 missing，用本包重新执行 `sudo ./install.sh`；它会重写 unit，
+把 `EnvironmentFile` 设为强制项并生成新的密码文件。升级后旧的 `/tmp/agilex-remote*`
+目录也应删除（安装器的新版本会自己清理随机临时目录）。
 
 ---
 
@@ -139,6 +168,11 @@ ssh -N -L 8765:127.0.0.1:8765 agilex@<机器人地址>
 
 输入第 2 节设的密码。浏览器会拿到一个 cookie；局域网内不要把这个 cookie 或密码分享出去。
 
+控制动作还需要一个短期 control lease：网页会在第一次主动动作时自动获取，
+E-STOP 本身不需要。清除 E-STOP 例外：必须有 lease 且带 `confirm="CLEAR"`。
+用 curl/脚本控制时先 `POST /api/lease/acquire`，后续控制 POST 带
+`X-Control-Lease` 头；详见 `README.md` 的 “Control lease” 一节。
+
 ### 3.4 安卓
 
 `android/` 是 WebView 壳，用 `android/build.sh` 自行构建。它走同一条 ntfy 通道自动发现机器人。
@@ -182,22 +216,39 @@ curl -s "http://127.0.0.1:8765/frame?cam=2" -o /tmp/c2.jpg && file /tmp/c2.jpg
 2. 点 **Enable arm**（`POST /api/arm/enable`）。使能前服务会把目标对齐到实测角度，所以**不会跳**。
 3. 用 1° 的 nudge 试一下，确认方向和幅度。
 4. **先别碰** MIT / 拖动示教 / 主从联动 / MOVE C —— 这四种会让手臂变柔顺或交给链路，需要人盯着第一次跑。
+   `/api/arm/mit` 的 `kp` / `kd` / `t_ref` 有服务端范围（0–500 / 0–50 / ±20），
+   负数、NaN、超范围都返回 400 且不改动原增益。
 
-采集轨迹：
+> 反馈安全：服务器每次读关节反馈都会校验有限性，并默认拒绝全零姿态（它与
+> CAN 静默无法区分）。如果确认手臂就是停在全零附近，用
+> `AGILEX_ALLOW_ZERO_POSE=1` 显式允许。反馈 stale/非法时，普通 MOVE J 只停
+> 输出并保持力矩；拖动示教 / 主从 / MOVE C 会发对应的硬件停止帧，MOVE C
+> 停止帧写失败才退回 `DisableArm`。
+
+采集轨迹（会走控制 lease；先 acquire，退出时自动释放）：
 
 ```bash
-curl -X POST :8765/api/record/start -d '{"task":"pick"}'
+. scripts/agilex-lease.sh
+lease_acquire "manual-$$" || exit $?
+trap 'lease_release' EXIT
+
+lease_curl /api/record/start '{"task":"pick"}'
 #  ... 操作 ...
-curl -X POST :8765/api/record/stop  -d '{"success":true}'
+lease_curl /api/record/stop  '{"success":true}'
 ```
 
 回放一段轨迹：
 
 ```bash
-curl -X POST :8765/api/traj/list
-curl -X POST :8765/api/traj/load-file -d '{"arm":0,"path":"/home/agilex/agilex-data/episodes/episode_0042"}'
-curl -X POST :8765/api/traj/play      -d '{"arm":0,"loop":false,"speed":0.5}'
+lease_curl /api/traj/list '{}'
+lease_curl /api/traj/load-file '{"arm":0,"path":"/home/agilex/agilex-data/episodes/episode_0042"}'
+lease_curl /api/traj/play      '{"arm":0,"loop":false,"speed":0.5}'
 ```
+
+> E-STOP 本身和 `lin=0,ang=0` 的 `/api/drive` 不需要 lease，所以急停/零速路径
+> 不会被 lease 阻断。清 E-STOP 不是急停动作：它需要有效 lease + body
+> `{"confirm":"CLEAR"}`（helper 的 `lease_clear_estop`）。其他控制 POST 没有
+> lease 会返回 HTTP 409。
 
 ---
 
@@ -253,5 +304,6 @@ sudo systemctl daemon-reload
 ./scripts/verify-bundle.sh <打包出来的.zip>
 ```
 
-它会解压到临时目录，跑**随包发布的那份测试**、检查所有 shell 语法、扫密码和真实 IP。
+它会解压到临时目录，跑**随包发布的那份测试**（模式回归 + 部署/凭据回归）、检查所有 shell 语法、扫明文密码/私钥/topic/真实地址。
+脚本兼容 GNU/BSD `mktemp`，并在 `python3` 存在但不可执行时回退到 `python` / `py -3`。
 这个脚本不是摆设：曾经有一次旧版测试文件被覆盖，回归测试静默丢失，而 bundle 照样"构建成功"。

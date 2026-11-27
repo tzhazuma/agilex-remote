@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "chassis": {
+    "connected": true,
+    "lin_x": 0.0,
+    "ang_z": 0.0
+  },
+  "arm": {
+    "side": "left",
+    "connected": true,
+    "enabled": false,
+    "mode": "pos_j",
+    "mode_actual": "MOVE_J",
+    "joints_enabled": [true, true, true, true, true, true],
+    "jitter": {
+      "cmd_hz": 49.8
+    }
+  },
+  "arms": [
+    {
+      "side": "left",
+      "connected": true,
+      "enabled": false,
+      "mode": "pos_j",
+      "mode_actual": "MOVE_J",
+      "joints_enabled": [true, true, true, true, true, true],
+      "jitter": {
+        "cmd_hz": 49.8
+      }
+    },
+    {
+      "side": "right",
+      "connected": true,
+      "enabled": false,
+      "mode": "pos_j",
+      "mode_actual": "MOVE_J",
+      "joints_enabled": [true, true, true, true, true, true],
+      "jitter": {
+        "cmd_hz": 50.1
+      }
+    }
+  ],
+  "limits": {
+    "max_lin": 0.08,
+    "max_ang": 0.15,
+    "max_joint_step_deg": 2.0,
+    "default_lin": 0.05,
+    "default_ang": 0.1,
+    "hw_max_lin": 0.5,
+    "hw_max_ang": 1.0,
+    "hw_max_source": "fixture"
+  },
+  "estop": false,
+  "watchdog_ms": 700
+}

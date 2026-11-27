@@ -23,7 +23,7 @@ to any AgileX + Piper build.
 | **Chassis drive** | Keyboard (WASD/arrows), mouse D-pad, on-screen joystick, or a physical gamepad |
 | **Dual arms** | Per-arm panels: incremental nudge, **absolute target angles**, gripper, enable/disable, per-joint fault display |
 | **3D view** | Hand-rolled forward-kinematics stick model of each arm, driven by the live joint angles, with the commanded target ghosted in amber |
-| **Cameras** | Two live MJPEG streams (one per arm), streamed straight from V4L2 with no re-encode |
+| **Cameras** | Two wrist MJPEG streams plus optional global BRIO (`cam=4`) and RealSense D455 (`cam=12`, YUYV) |
 | **Safety** | Hard server-side clamps, a watchdog that forces a stop, E-STOP, and a fault-clearing reset |
 | **Discovery** | The robot publishes its own DHCP address to an ntfy topic, so a client finds it after a reboot without scanning |
 | **Android** | A thin WebView shell (`android/`) with a launcher icon, ntfy auto-discovery, and a configurable base URL |
@@ -69,8 +69,10 @@ Each episode becomes a self-contained directory:
 ```
 episode_0007/
     meta.json          task, timing, frame count, outcome, camera warm-up state
-    cam0/000001.jpg    left arm camera
-    cam2/000001.jpg    right arm camera
+    cam0/000001.jpg    right wrist camera
+    cam2/000001.jpg    left wrist camera
+    cam4/000001.jpg    optional global Logitech BRIO
+    cam12/000001.jpg   optional global RealSense D455
     timeline.csv       one row per tick
 ```
 
@@ -221,6 +223,8 @@ whole watchdog window before a stop is even commanded:
 coast = watchdog_ms / 1000 * speed
 ```
 
+A single `/api/drive` POST is not a duration-controlled move: it only refreshes the target until the watchdog expires. For a sustained move, continuously re-post the command (and lease heartbeat) faster than `WATCHDOG_MS`, then explicitly send zero. At `0.03 m/s`, one isolated request can expire after roughly 9 mm even if the client sleeps for 0.2 s; this made earlier tests look like the chassis had not moved. A successful HTTP response alone is not motion evidence—verify fresh images or calibrated wheel counts.
+
 At the original 0.08 m/s cap a 700 ms window was 5.6 cm and irrelevant. At
 2.3 m/s it would be **1.6 m**. The default is therefore 300 ms (0.69 m at full
 speed). Tune it with `AGILEX_WATCHDOG_MS`.
@@ -237,12 +241,17 @@ All limits are environment variables — see the table below.
 # x11vnc is optional but recommended for a real desktop view
 sudo apt-get install -y x11vnc can-utils ethtool ffmpeg
 
-sudo install -d /usr/local/share/agilex-remote
-sudo install -m 0755 server/agilex-remote-server.py /usr/local/share/agilex-remote/
-sudo install -m 0644 server/remote-ui.html          /usr/local/share/agilex-remote/
-sudo install -m 0644 server/install-server.sh       /tmp/
-sudo bash /tmp/install-server.sh      # or just copy the unit from that script
+# from the checkout, on the robot:
+sudo ./install.sh
+# or, equivalently:
+sudo ./server/install-server.sh
 ```
+
+`install-server.sh` installs both server files itself; you do not need to copy
+them to `/usr/local/share` or `/tmp` first. If the files live elsewhere, point
+`AGILEX_PAYLOAD` at the directory that contains `agilex-remote-server.py` and
+`remote-ui.html`. The web password is prompted (or read from
+`AGILEX_PASSWORD` / `AGILEX_PASSWORD_FILE`); there is no default.
 
 The chassis needs `tracer_base` running to bridge `/cmd_vel` onto CAN:
 
@@ -258,10 +267,136 @@ ros2 launch tracer_base tracer_base.launch.py
 
 ### Client
 
-Open `http://<robot-ip>:8765/`. Off-loopback clients get a password sign-in page
-(default password `changeme` — **change it**, see `AGILEX_PASSWORD`).
+Open `http://<robot-ip>:8765/`. Off-loopback clients get a password sign-in page;
+the password is chosen at install time (there is no default, see `AGILEX_PASSWORD`).
 
 Loopback is exempt, so `ssh -L 8765:127.0.0.1:8765 robot` skips the login.
+
+### Control lease (single controller)
+
+Motion is single-controller by design. All non-GET **control** POSTs
+(`/api/arm*`, `/api/gripper`, `/api/arm/mode|mit|movec`, `/api/traj/load|play|pause|stop`,
+`/api/teach`, `/api/master-slave`, `/api/record/start|stop`,
+`/api/chassis/clear-fault`, and non-zero `/api/drive`) require a short-lived lease.
+`GET /api/status`, `/frame`, `/video` and `GET /api/lease/status` stay open.
+**E-STOP itself is exempt**; a zero-velocity `/api/drive` is also exempt.
+`/api/estop/clear` is **not** a panic action: it requires a valid lease and
+body `{"confirm":"CLEAR"}`, so one tab cannot clear another operator's latch.
+The UI's clear button must acquire the lease and send that confirm.
+
+```bash
+# 1. acquire once; keep the secret in memory (the shell helper uses a 0600
+#    curl config file, never a log)
+curl -s -X POST http://127.0.0.1:8765/api/lease/acquire \
+  -H 'Content-Type: application/json' -d '{"controller":"laptop-1"}'
+# => {"ok":true,"lease":"<random>","controller":"laptop-1","expires_in":20.0,...}
+
+# 2. every control POST carries the secret in this header
+curl -s -X POST http://127.0.0.1:8765/api/arm \
+  -H 'Content-Type: application/json' \
+  -H "X-Control-Lease: $LEASE" \
+  -d '{"arm":0,"joint":0,"delta_deg":0.1}'
+
+# 3. extend before the 20 s TTL expires
+curl -s -X POST http://127.0.0.1:8765/api/lease/heartbeat \
+  -H "X-Control-Lease: $LEASE" -d '{}'
+
+# 4. release (only the holder can)
+curl -s -X POST http://127.0.0.1:8765/api/lease/release \
+  -H "X-Control-Lease: $LEASE" -d '{"controller":"laptop-1"}'
+
+# 5. explicit takeover; requires the exact confirm token and is audited
+curl -s -X POST http://127.0.0.1:8765/api/lease/acquire \
+  -H 'Content-Type: application/json' \
+  -d '{"controller":"laptop-2","takeover":true,"confirm":"TAKEOVER"}'
+```
+
+For shell scripts, source `scripts/agilex-lease.sh` instead of hand-rolling the
+header. It acquires, writes the secret to a 0600 curl config file (never argv or
+logs), auto-releases on EXIT, and can heartbeat a long run:
+
+```bash
+. scripts/agilex-lease.sh
+lease_acquire "my-script" || exit $?
+lease_start_heartbeat 5
+lease_curl /api/arm '{"arm":0,"joint":0,"delta_deg":0.1}'
+lease_clear_estop        # lease + {"confirm":"CLEAR"}; fails without both
+lease_release
+```
+
+`lease_curl` returns 0 only for HTTP 2xx. HTTP 409 returns 9, and any other
+non-2xx (including 500) returns 1, so a failed E-STOP/zero-speed request is
+never reported as success.
+
+`tools/run-smolvla.py` does the same in Python: it acquires before the first
+command, heartbeats in a daemon thread, turns a 409 into `LeaseLost`, and
+releases in `finally`. `--dry-run` is a truly offline check: no policy load,
+no server request, no lease.
+`verify-modes.sh` and `mode-smoke.sh` acquire automatically; their explicit
+`AGILEX_ALLOW_MODE_TESTS=1` safety gate is unchanged.
+
+> `tools/feedback_control.py` is a pure offline decoder/controller library: it
+> opens no socket and sends no HTTP, so it neither needs nor receives a lease.
+> A future online adapter that POSTs to the server must acquire the lease and
+> send `X-Control-Lease` itself.
+
+The server stores only `sha256(lease)` plus an expiry, never the secret. A missing,
+expired, or wrong secret gets HTTP 409 with the current owner in `lease`.
+The web UI does **not** acquire on page load or while watching cameras; it
+acquires on the first active action, shows `CONTROL: YOU` / `CONTROL: <id>` /
+`CONTROL: free`, and provides **Take control** (with confirm) and **Release**.
+E-STOP remains available without the lease.
+
+Every control POST is audited as one JSON line in the service journal (stderr):
+UTC time, client address, controller id, path, a whitelist-summarized body, and
+result. The controller is the **lease holder** when a valid lease is presented;
+lease-exempt requests are marked `controller_verified:false`. Password, cookie,
+token, and lease values are never written. Successful non-zero `/api/drive`
+audits are sampled (default 1/s); zero drive and errors are always recorded.
+
+### Feedback safety and stop behavior
+
+Joint feedback is re-validated on **every** 5 Hz read, not just at startup: all
+six values must be finite, and an all-zero pose is rejected by default because a
+silent CAN bus reports exactly that. A genuine arm parked at zero is legal but
+indistinguishable, so it needs an explicit opt-in:
+
+```bash
+AGILEX_ALLOW_ZERO_POSE=1   # only for an arm you have confirmed is parked at 0°
+```
+
+Do not set this to paper over a dead bus: the startup probe still requires the
+CAN RX counter to advance. While feedback is stale or invalid, every motion
+entry point (nudge, target, home, gripper, trajectory, teach, master/slave)
+returns failure, and `connected` is false.
+
+What a stop does depends on what owns the arm:
+
+| Active source | Stop action |
+|---|---|
+| Plain MOVE J | Stop sending `JointCtrl` and hold the measured pose. **No `DisableArm`**: dropping torque on a raised arm is worse than stopping the stream. |
+| Drag teach | `MotionCtrl_1(grag_teach_ctrl=0x02)` (documented "end record"). |
+| Master/slave | `MasterSlaveConfig(linkage_config=0x00)` (unlink). |
+| MOVE C | `MotionCtrl_1(emergency_stop=0x01)` (0x02 is resume). If that frame itself fails, `DisableArm` is the permitted last resort. |
+
+The same table applies to E-STOP, lease expiry/release/takeover, and a latched
+feedback fault. E-STOP additionally calls `DisableArm` because it is a panic
+action.
+
+The first lease acquire (`free → held`) deliberately does **not** cancel
+motion: the usual sequence is "take the lease, then start the trajectory".
+Only release, expiry, takeover, or a missed release+re-acquire cancels.
+
+### MIT gain bounds
+
+`/api/arm/mit` and `ArmBridge.set_mit` enforce the same conservative box before
+anything reaches the motors: `kp` 0–500, `kd` 0–50, `t_ref` −20–20. NaN, Inf,
+negative gains, empty lists, and out-of-box values return HTTP 400 and leave the
+previous gains untouched. Bench-specific ceilings can be raised with
+`AGILEX_MIT_KP_MAX` / `AGILEX_MIT_KD_MAX`; `t_ref` is fixed.
+
+A request body that is valid JSON but not an object (a list, string, number) gets
+HTTP 400 before any gate runs, instead of closing the connection.
 
 ### Android
 
@@ -306,10 +441,13 @@ to `ssh`, so `ssh robot` keeps working across reboots.
 |---|---|---|
 | `AGILEX_REMOTE_HOST` | `0.0.0.0` | Bind address |
 | `AGILEX_REMOTE_PORT` | `8765` | Port |
-| `AGILEX_PASSWORD` | `changeme` | Sign-in password for off-loopback clients |
+| `AGILEX_PASSWORD` | *(unset)* | Sign-in password for off-loopback clients; the installer requires one (min 8 chars) |
 | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | `2.3` / `0.7853` | Hard clamp |
 | `AGILEX_DEFAULT_LIN` / `AGILEX_DEFAULT_ANG` | `0.5` / `0.3` | UI slider start |
 | `AGILEX_WATCHDOG_MS` | `300` | Stop-if-silent window (= braking distance) |
+| `AGILEX_BRIO_FRAME_URL` | *(unset)* | Optional shared global JPEG endpoint; enables `/frame|video?cam=4` and `cam4` recording without reopening V4L2 |
+| `AGILEX_REALSENSE_RGB_DEV` | *(unset)* | Optional D455 RGB device path; enables `cam12` |
+| `AGILEX_CAM12_INPUT_FORMAT` | `mjpeg` | Set `yuyv422` for the D455 RGB node |
 | `AGILEX_MAX_JOINT_STEP` | `2.0` | Max degrees per nudge |
 | `AGILEX_ARM_SPEED_PCT` | `25` | Piper `move_spd_rate_ctrl` |
 | `AGILEX_ARM_CAN` / `AGILEX_ARM_CAN_RIGHT` | `can_left` / `can_right` | Arm buses |
@@ -400,7 +538,7 @@ in order, first hit wins:
 4. **mDNS** `agilex.local`.
 5. **Sequential sweep**, known /24s first, 600 s budget, one sweep at a time,
    every candidate validated by SSH banner + host key. **Set your own subnet:**
-   `export AGILEX_SCAN_RANGE=10.0.0.0/16` — the shipped default is a placeholder.
+   `export AGILEX_SCAN_RANGE=<ip>/16` — the shipped default is a placeholder.
 
 Set the topic once: `echo '<your-topic>' > ~/.config/agilex/ntfy-topic`.
 
@@ -414,33 +552,54 @@ Set the topic once: `echo '<your-topic>' > ~/.config/agilex/ntfy-topic`.
 sudo ./install.sh
 ```
 
-Then open `http://<robot-ip>:8765/`. The web UI password comes from
-`/etc/agilex-remote.env` (`AGILEX_PASSWORD=...`, mode 0600). **The default is
-`changeme` — change it.**
+Then open `http://<robot-ip>:8765/`. The web UI password is chosen at install
+time and stored in `/etc/agilex-remote.env` (`AGILEX_PASSWORD=...`, mode 0600).
+There is **no default**; the installer refuses to run without a real password
+(8+ chars, not `changeme`). Rotate it with:
+
+```bash
+sudo AGILEX_PASSWORD='<new-password>' ./server/install-server.sh --env-only
+sudo systemctl restart agilex-remote
+```
 
 ## Configuration
 
 | Setting | Where | Default |
 |---|---|---|
-| Web UI password | `/etc/agilex-remote.env` → `AGILEX_PASSWORD` | `changeme` |
+| Web UI password | `/etc/agilex-remote.env` → `AGILEX_PASSWORD` | *(unset; installer requires one)* |
 | Listen address / port | unit env `AGILEX_REMOTE_HOST`, code `PORT` | `0.0.0.0:8765` |
-| Chassis speed cap | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | 2.3 m/s, 1.2 rad/s |
+| Chassis speed cap | `AGILEX_MAX_LIN` / `AGILEX_MAX_ANG` | 2.3 m/s, 0.7853 rad/s |
 | Arm speed | `AGILEX_ARM_SPEED_PCT` | 25 % |
 | Max target lag | `AGILEX_MAX_TARGET_LAG` | 15° |
 | Resync tolerance | `AGILEX_RESYNC_MARGIN` | 5° |
+| Feedback staleness | `AGILEX_FEEDBACK_STALE_S` | 2 s |
+| Accept an all-zero pose | `AGILEX_ALLOW_ZERO_POSE` | `0` (reject) |
+| MIT kp / kd ceiling | `AGILEX_MIT_KP_MAX` / `AGILEX_MIT_KD_MAX` | 500 / 50 |
 | ntfy topic | `~/.config/agilex/ntfy-topic` | none |
 
 ## Tests
 
 ```bash
 python3 tools/test-modes-offline.py     # 41 assertions, fake CAN, no hardware
-./scripts/verify-modes.sh               # 12 checks on the robot, no motion
-./scripts/mode-smoke.sh                 # 23 checks on the robot, no motion
+python3 scripts/test-lease-offline.py   # fake lease API: acquire/heartbeat/409/release
+./scripts/verify-modes.sh               # hardware read-back; NOT motion-free (see gate)
+./scripts/mode-smoke.sh                 # MOVE P + trajectory replay; NOT motion-free
 ./scripts/verify-bundle.sh <zip>        # prove the SHIPPED tree works, from a clean extract
 ```
 
+On Windows use `python` instead of `python3` (the Store `python3` stub may not run);
+`verify-bundle.sh` probes both and falls back automatically.
+
+The two on-robot scripts change arm modes and are **not** "no motion" tests:
+`verify-modes.sh` can switch to MOVE P (and to MIT with a second opt-in), and
+`mode-smoke.sh` replays a trajectory. Both refuse to start unless you clear the
+workspace and set `AGILEX_ALLOW_MODE_TESTS=1`. MIT additionally needs
+`AGILEX_ALLOW_MIT_TEST=1` and is refused while an arm is enabled unless
+`AGILEX_ALLOW_MIT_WHILE_ENABLED=1` is set.
+
 `verify-bundle.sh` exists because a stale copy of the test file was once copied
 over the fixed one, silently dropping the regression tests while the bundle
-still built and shipped. It extracts the zip to a throwaway directory, runs the
-shipped tests, checks every shell script parses, and scans for credentials and
+still built and shipped. It extracts the zip to a throwaway directory, runs all
+four shipped suites (mode 41+, server 370+, feedback 272+, lease 23+) with PASS
+floors, checks every shell script parses, and scans for credentials and
 real addresses. Run it before publishing.

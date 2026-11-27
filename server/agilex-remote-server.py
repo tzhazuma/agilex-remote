@@ -32,7 +32,9 @@ That is inherent to ROS control - the physical remote stops driving it.
 """
 
 import csv
+import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -42,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ----------------------------------------------------------------------------
@@ -68,34 +71,346 @@ PORT = int(os.environ.get("AGILEX_REMOTE_PORT", "8765"))
 #
 #   AGILEX_PASSWORD   - the password (default "changeme")
 #   AGILEX_ALLOW_ANON - 1 disables the check entirely
+#   AGILEX_SESSION_TTL - seconds a login cookie stays valid (default 12 h)
 ALLOW_ANON = os.environ.get("AGILEX_ALLOW_ANON", "0") == "1"
 PASSWORD = os.environ.get("AGILEX_PASSWORD", "changeme")
-SESSION_FILE = os.environ.get("AGILEX_SESSION_FILE",
-                              "/usr/local/share/agilex-remote/.session")
+SESSION_TTL_S = float(os.environ.get("AGILEX_SESSION_TTL", str(12 * 3600)))
+SESSION_MAX = int(os.environ.get("AGILEX_SESSION_MAX", "32"))
 COOKIE_NAME = "agilex_sid"
 
 
-def load_or_make_session():
-    """A stable session secret, so logins survive a service restart."""
-    try:
-        with open(SESSION_FILE) as f:
-            s = f.read().strip()
-            if s:
-                return s
-    except Exception:
-        pass
-    s = secrets.token_urlsafe(32)
-    try:
-        os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
-        with open(SESSION_FILE, "w") as f:
-            f.write(s)
-        os.chmod(SESSION_FILE, 0o600)
-    except Exception as e:
-        log(f"could not persist session secret ({e!r}); logins reset on restart")
-    return s
+class SessionStore:
+    """Per-login sessions with a TTL and a hard cap.
+
+    The previous design used one process-wide token persisted to disk, handed to
+    every browser and accepted via ?token= forever. A leaked token was therefore
+    permanent remote control. Sessions are now per-login, expire, are revoked on
+    logout, and the raw token is never stored server-side - only its SHA-256.
+    Restarting the service invalidates every session; that is deliberate.
+    """
+
+    def __init__(self, ttl=None, max_sessions=None):
+        self.ttl = float(SESSION_TTL_S if ttl is None else ttl)
+        self.max_sessions = int(SESSION_MAX if max_sessions is None else max_sessions)
+        self._sessions = {}          # sha256(token) -> expiry epoch
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _purge_locked(self, now):
+        for key, exp in list(self._sessions.items()):
+            if exp <= now:
+                self._sessions.pop(key, None)
+
+    def create(self):
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self._lock:
+            self._purge_locked(now)
+            if len(self._sessions) >= self.max_sessions:
+                oldest = min(self._sessions, key=self._sessions.get)
+                self._sessions.pop(oldest, None)
+            self._sessions[self._key(token)] = now + self.ttl
+        return token
+
+    def valid(self, token):
+        if not token:
+            return False
+        now = time.time()
+        with self._lock:
+            self._purge_locked(now)
+            exp = self._sessions.get(self._key(token))
+            return exp is not None and exp > now
+
+    def revoke(self, token):
+        if not token:
+            return
+        with self._lock:
+            self._sessions.pop(self._key(token), None)
 
 
-ACCESS_TOKEN = None  # set in main()
+def session_cookie(token, ttl):
+    return ("%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d"
+            % (COOKIE_NAME, token, max(1, int(ttl))))
+
+
+def clear_cookie():
+    return "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict" % COOKIE_NAME
+
+
+# ---------------------------------------------------------------------------
+# Control lease: one controller at a time, short TTL, hashed secret.
+# ---------------------------------------------------------------------------
+LEASE_TTL_S = float(os.environ.get("AGILEX_LEASE_TTL", "20"))
+LEASE_TAKEOVER_CONFIRM = "TAKEOVER"
+
+LEASE_EXEMPT = {
+    "/api/login", "/api/logout",
+    "/api/lease/acquire", "/api/lease/heartbeat", "/api/lease/release",
+    "/api/estop",                              # panic path: no lease
+    "/api/record/status", "/api/traj/list",    # read-only POST queries
+}
+
+# Endpoints that can command or re-enable motion.  During a latched E-STOP they
+# are rejected before reaching ArmBridge (E-STOP itself and zero drive stay open).
+MOTION_ENDPOINTS = {
+    "/api/arm", "/api/arm/target", "/api/arm/enable", "/api/arm/reset",
+    "/api/arm/home", "/api/gripper", "/api/arm/mode", "/api/arm/mit",
+    "/api/arm/movec", "/api/traj/load", "/api/traj/load-file",
+    "/api/traj/play", "/api/teach", "/api/master-slave",
+    "/api/chassis/clear-fault",
+}
+
+AUDIT_DRIVE_S = float(os.environ.get("AGILEX_AUDIT_DRIVE_S", "1.0"))
+
+# Feedback-stale cannot command or replay; stop/disable/recovery actions remain.
+FEEDBACK_BLOCKED = {
+    "/api/arm", "/api/arm/target", "/api/arm/home", "/api/gripper",
+    "/api/traj/load", "/api/traj/load-file", "/api/traj/play",
+    "/api/arm/mode", "/api/arm/mit", "/api/arm/movec",
+}
+
+SENSITIVE_KEYS = {"password", "lease", "secret", "token", "cookie",
+                  "authorization", "x-control-lease"}
+
+CONTROL_BODY_KEYS = {
+    "/api/arm": {"arm", "joint", "delta_deg"},
+    "/api/arm/target": {"arm", "joints_deg", "joint", "deg"},
+    "/api/arm/enable": {"arm", "enable"},
+    "/api/arm/reset": {"arm"},
+    "/api/arm/home": {"arm"},
+    "/api/gripper": {"arm", "delta_deg"},
+    "/api/arm/mode": {"arm", "mode"},
+    "/api/arm/mit": {"arm", "kp", "kd", "t_ref"},
+    "/api/arm/movec": {"arm", "points"},
+    "/api/traj/load": {"arm", "name", "points", "dt"},
+    "/api/traj/load-file": {"arm", "path", "dt"},
+    "/api/traj/play": {"arm", "loop", "speed"},
+    "/api/traj/pause": {"arm"},
+    "/api/traj/stop": {"arm"},
+    "/api/teach": {"arm", "on", "execute"},
+    "/api/master-slave": {"on", "leader", "follower"},
+    "/api/chassis/clear-fault": set(),
+    "/api/record/start": {"task", "notes"},
+    "/api/record/stop": {"success"},
+    "/api/drive": {"lin", "ang"},
+    "/api/estop": set(),
+    "/api/estop/clear": {"confirm"},
+    "/api/lease/acquire": {"controller", "takeover", "confirm"},
+    "/api/lease/heartbeat": set(),
+    "/api/lease/release": {"controller"},
+    "/api/record/status": set(),
+    "/api/traj/list": set(),
+}
+
+
+def clean_controller(value):
+    """Controller ids are audit metadata, never an auth secret."""
+    s = str(value or "unknown")[:64]
+    s = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in s).strip()
+    return s or "unknown"
+
+
+def _short(value, maxlen=120):
+    if isinstance(value, str):
+        return value[:maxlen] + ("..." if len(value) > maxlen else "")
+    if isinstance(value, list):
+        if len(value) > 12:
+            return {"count": len(value), "first": value[0] if value else None,
+                    "last": value[-1] if value else None}
+        return value
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)[:maxlen]
+
+
+def summarize_body(path, body):
+    """Whitelist the control body for the audit log.  Never emit secrets."""
+    if not isinstance(body, dict):
+        return {"type": type(body).__name__}
+    out = {}
+    if "controller" in body:
+        # Body controller is untrusted metadata; the audit top-level controller
+        # comes from the lease holder, never from this field.
+        out["body_controller"] = clean_controller(body.get("controller"))
+    for key in CONTROL_BODY_KEYS.get(path, set()):
+        if key in SENSITIVE_KEYS or key not in body:
+            continue
+        value = body[key]
+        if key == "notes":
+            out["notes_len"] = len(str(value))
+        elif key == "path":
+            out["path_basename"] = os.path.basename(str(value))
+        elif key == "points" and isinstance(value, list):
+            out["points"] = {"count": len(value),
+                             "first": value[0] if value else None,
+                             "last": value[-1] if value else None}
+        else:
+            out[key] = _short(value)
+    return out
+
+
+def summarize_result(obj, code):
+    if not isinstance(obj, dict):
+        return {"code": code}
+    out = {"code": code, "ok": obj.get("ok")}
+    for key in ("error", "estop", "arms_disabled", "enabled", "motors_enabled",
+                "mode", "mode_verified", "frames", "duration_s", "took_over"):
+        if key in obj:
+            out[key] = obj[key]
+    if "lease" in obj:
+        out["lease"] = "<redacted>"
+    return out
+
+
+class AuditLog:
+    """Journald-friendly JSON audit, with an in-memory tail for tests."""
+
+    def __init__(self, cap=1000):
+        self._lock = threading.Lock()
+        self.events = []
+        self.cap = cap
+        self.echo = os.environ.get("AGILEX_AUDIT_ECHO", "1") != "0"
+        self._last_drive_audit = -float('inf')
+
+    def allow_drive_sample(self, now=None, interval=None):
+        """Rate-limit successful non-zero drive audit; zero/error never sampled."""
+        now = time.monotonic() if now is None else now
+        interval = AUDIT_DRIVE_S if interval is None else interval
+        with self._lock:
+            if now - self._last_drive_audit < interval:
+                return False
+            self._last_drive_audit = now
+            return True
+
+    def record(self, rec):
+        with self._lock:
+            self.events.append(rec)
+            if len(self.events) > self.cap:
+                del self.events[:-self.cap]
+        if self.echo:
+            try:
+                log("AUDIT " + json.dumps(rec, ensure_ascii=False, sort_keys=True))
+            except Exception:
+                pass
+
+    def clear(self):
+        with self._lock:
+            self.events.clear()
+            self._last_drive_audit = -float('inf')
+
+
+AUDIT = AuditLog()
+
+
+class LeaseStore:
+    """Single-controller lease.  Stores only sha256(secret) + expiry."""
+
+    def __init__(self, ttl=None, clock=None):
+        self.ttl = float(LEASE_TTL_S if ttl is None else ttl)
+        # Monotonic: NTP/manual wall-clock jumps must not extend a lease.
+        self.clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._hash = None
+        self._controller = None
+        self._expires = 0.0
+        self._acquired_at = 0.0
+        self._last_seen = 0.0
+        self._generation = 0
+
+    @staticmethod
+    def _key(secret):
+        return hashlib.sha256(str(secret).encode("utf-8")).hexdigest()
+
+    def _purge_locked(self):
+        if self._hash is not None and self.clock() >= self._expires:
+            self._hash = None
+            self._controller = None
+            self._expires = 0.0
+            self._generation += 1
+
+    def _status_locked(self, now):
+        held = self._hash is not None and now < self._expires
+        return {
+            "held": held,
+            "controller": self._controller if held else None,
+            "expires_in": round(max(0.0, self._expires - now), 1) if held else 0.0,
+            "expires_at": (time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(time.time() + max(0.0, self._expires - now)))
+                if held else None),
+            "ttl_s": self.ttl,
+            "generation": self._generation,
+        }
+
+    def status(self):
+        with self._lock:
+            self._purge_locked()
+            return self._status_locked(self.clock())
+
+    def acquire(self, controller, takeover=False, confirm=None):
+        with self._lock:
+            self._purge_locked()
+            now = self.clock()
+            held = self._hash is not None
+            if held and not takeover:
+                return {"ok": False, "error": "control lease held",
+                        **self._status_locked(now)}
+            if held and takeover and str(confirm or "") != LEASE_TAKEOVER_CONFIRM:
+                return {"ok": False,
+                        "error": "takeover requires confirm=TAKEOVER",
+                        **self._status_locked(now)}
+            secret = secrets.token_urlsafe(32)
+            self._hash = self._key(secret)
+            self._controller = clean_controller(controller)
+            self._expires = now + self.ttl
+            self._acquired_at = now
+            self._last_seen = now
+            self._generation += 1
+            return {"ok": True, "lease": secret,
+                    "controller": self._controller,
+                    "expires_in": self.ttl, "took_over": bool(held)}
+
+    def heartbeat(self, secret):
+        with self._lock:
+            self._purge_locked()
+            if (not secret or self._hash is None
+                    or not secrets.compare_digest(self._key(secret), self._hash)):
+                return {"ok": False, "error": "lease expired or not held"}
+            self._expires = self.clock() + self.ttl
+            self._last_seen = self.clock()
+            return {"ok": True, "controller": self._controller,
+                    "expires_in": self.ttl}
+
+    def release(self, secret):
+        with self._lock:
+            self._purge_locked()
+            if (not secret or self._hash is None
+                    or not secrets.compare_digest(self._key(secret), self._hash)):
+                return {"ok": False, "error": "not the lease holder"}
+            controller = self._controller
+            self._hash = None
+            self._controller = None
+            self._expires = 0.0
+            self._generation += 1
+            return {"ok": True, "controller": controller}
+
+    def check(self, secret):
+        with self._lock:
+            self._purge_locked()
+            return bool(secret and self._hash is not None
+                        and secrets.compare_digest(self._key(secret), self._hash))
+
+    def controller_for(self, secret):
+        with self._lock:
+            self._purge_locked()
+            if (secret and self._hash is not None
+                    and secrets.compare_digest(self._key(secret), self._hash)):
+                return self._controller
+            return None
+
 
 LOGIN_PAGE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8">
@@ -171,6 +486,28 @@ MAX_JOINT_STEP_DEG = float(os.environ.get("AGILEX_MAX_JOINT_STEP", "2.0"))
 # How far the held target may ever sit from the measured angle. Bounds the
 # damage if a motor stops following; see ArmBridge.nudge for why.
 MAX_TARGET_LAG_DEG = float(os.environ.get("AGILEX_MAX_TARGET_LAG", "15.0"))
+# How old the 5 Hz joint feedback may be before an arm is considered unhealthy.
+# `connected` used to latch at startup, so a bus that died later still looked
+# fine; the UI and check scripts then trusted frozen numbers.
+FEEDBACK_STALE_S = float(os.environ.get("AGILEX_FEEDBACK_STALE_S", "2.0"))
+# A genuine all-zero pose is legal but indistinguishable from a silent bus.
+# Default is fail-closed; opt in only for a known parked-at-zero arm.
+ALLOW_ZERO_POSE = os.environ.get("AGILEX_ALLOW_ZERO_POSE", "0") == "1"
+# Re-read the arm's own mode periodically. mode_actual used to be updated only
+# on mode changes, so an externally changed mode went unnoticed.
+MODE_POLL_S = float(os.environ.get("AGILEX_MODE_POLL_S", "5.0"))
+MODE_STALE_S = float(os.environ.get("AGILEX_MODE_STALE_S", "15.0"))
+# MOVE C dispatches Cartesian EndPose frames with no joint-space lag guard.
+# It is experimental, so it must be opted into explicitly after a risk review.
+ENABLE_MOVEC = os.environ.get("AGILEX_ENABLE_MOVEC", "0") == "1"
+# MIT gain box. piper_sdk documents the JointMitCtrl types but no numeric
+# limits, so these are conservative operator-side bounds: kp past a few hundred
+# turns impedance control into a stiff position servo (and the arm can buzz),
+# kd is a damping term, and the feed-forward torque must stay small on a 6-DoF
+# arm. Override per bench with the env vars, never from the browser.
+MIT_KP_RANGE = (0.0, float(os.environ.get("AGILEX_MIT_KP_MAX", "500")))
+MIT_KD_RANGE = (0.0, float(os.environ.get("AGILEX_MIT_KD_MAX", "50")))
+MIT_TREF_RANGE = (-20.0, 20.0)
 # How far outside the datasheet joint limits a "hold where you are" resync
 # may go. The arm really does rest a couple of degrees outside them (left
 # J2 -2.06 vs 0..180, J3 +1.44 vs -170..0), and clamping that away creates a
@@ -193,7 +530,15 @@ CMD_VEL_TOPIC = os.environ.get("AGILEX_CMD_VEL_TOPIC", "/cmd_vel")
 ODOM_TOPIC = os.environ.get("AGILEX_ODOM_TOPIC", "/odom")
 STATUS_TOPIC = os.environ.get("AGILEX_STATUS_TOPIC", "/tracer_status")
 
-VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}   # 0 = faces the ARM, 2 = faces the FLOOR
+VIDEO_DEV = {0: "/dev/video0", 2: "/dev/video2"}
+BRIO_FRAME_URL = os.environ.get("AGILEX_BRIO_FRAME_URL", "").strip()
+if BRIO_FRAME_URL:
+    VIDEO_DEV[4] = BRIO_FRAME_URL
+REALSENSE_RGB_DEV = os.environ.get("AGILEX_REALSENSE_RGB_DEV", "").strip()
+if REALSENSE_RGB_DEV:
+    VIDEO_DEV[12] = REALSENSE_RGB_DEV
+CAMERA_META = {"cam0": "right wrist", "cam2": "left wrist", "cam4": "global Logitech BRIO",
+               "cam12": "global RealSense D455"}
 VIDEO_W, VIDEO_H, VIDEO_FPS = 640, 480, 12
 # The rate we ask the CAMERA for. Must be requested at the input (-framerate),
 # not only on the output: otherwise the device negotiates its maximum mode and
@@ -221,6 +566,108 @@ def log(*a):
 
 def clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
+
+
+def finite_float(value):
+    """Return a finite float or None.  Used by every motion entry point."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def finite_list(values, limit=6):
+    if not isinstance(values, (list, tuple)) or len(values) < limit:
+        return None
+    out = []
+    for v in list(values)[:limit]:
+        f = finite_float(v)
+        if f is None:
+            return None
+        out.append(f)
+    return out
+
+
+def finite_values(values, max_len=6):
+    if not isinstance(values, (list, tuple)) or not values:
+        return None
+    if len(values) > max_len:
+        return None
+    out = []
+    for v in values:
+        f = finite_float(v)
+        if f is None:
+            return None
+        out.append(f)
+    return out
+
+
+def validate_limits(limits):
+    if not isinstance(limits, (list, tuple)) or len(limits) != 6:
+        return False
+    for pair in limits:
+        try:
+            lo, hi = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+            return False
+    return True
+
+
+def bus_probe_ok(rx0, rx1):
+    """Fail closed when the CAN RX counter cannot be read."""
+    if rx0 is None or rx1 is None:
+        return False
+    return rx1 > rx0
+
+
+def feedback_sane(values, allow_zero=None):
+    """Reject non-finite feedback and, by default, the all-zero 'bus silent' pose."""
+    if not isinstance(values, (list, tuple)) or len(values) != 6:
+        return False
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(v) for v in vals):
+        return False
+    if all(abs(v) < 1e-6 for v in vals):
+        return bool(ALLOW_ZERO_POSE if allow_zero is None else allow_zero)
+    return True
+
+
+def mit_gain_values(value, limit=6):
+    """Normalise one MIT parameter to a short list of floats, or None if bad."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return [float(value)] * limit
+    if isinstance(value, (list, tuple)) and 0 < len(value) <= limit:
+        out = [finite_float(v) for v in value]
+        return None if any(v is None for v in out) else out
+    return None
+
+
+def validate_mit_gains(kp=None, kd=None, t_ref=None):
+    """Return an error string, or None when every supplied MIT gain is usable.
+
+    Enforced in ArmBridge.set_mit as well as the HTTP handler so a caller that
+    reaches the class directly cannot install an out-of-box gain.
+    """
+    for name, value, (lo, hi) in (("kp", kp, MIT_KP_RANGE),
+                                  ("kd", kd, MIT_KD_RANGE),
+                                  ("t_ref", t_ref, MIT_TREF_RANGE)):
+        if value is None:
+            continue
+        vals = mit_gain_values(value)
+        if vals is None:
+            return f"{name} must be a scalar or 1..6 finite numbers"
+        for v in vals:
+            if not (lo <= v <= hi):
+                return f"{name}={v:g} outside [{lo:g}, {hi:g}]"
+    return None
 
 
 # ----------------------------------------------------------------------------
@@ -483,6 +930,9 @@ class ArmBridge:
         self.joints = [0.0] * 6       # target, degrees
         self._measured = [0.0] * 6
         self._meas_ok = False
+        self._last_feedback = 0.0
+        self._feedback_fault = False
+        self._last_mode_check = 0.0
         self.joints_enabled = [False] * 6
         self.faults = [[] for _ in range(6)]
         self.gripper = 0.0
@@ -512,6 +962,9 @@ class ArmBridge:
         self._stop = threading.Event()
         self.cmd_hz = 0.0
         self.feedback_hz = 0.0
+        if not validate_limits(limits):
+            log(f"arm {channel} ({side}) INVALID LIMITS: {limits!r}; refusing to start")
+            return
         try:
             sys.path.insert(0, "/home/agilex/.local/lib/python3.10/site-packages")
             from piper_sdk import C_PiperInterface_V3
@@ -526,17 +979,23 @@ class ArmBridge:
             rx0 = bus_rx_packets(channel)
             time.sleep(2.0)
             rx1 = bus_rx_packets(channel)
-            if rx0 is not None and rx1 is not None and rx1 <= rx0:
+            if not bus_probe_ok(rx0, rx1):
                 self.ok = False
-                log(f"arm {channel} ({side}) NO FEEDBACK: bus silent "
-                    f"(rx {rx0} -> {rx1} in 2 s). Arm unpowered, e-stop pressed, "
-                    f"or CAN cable off. Marking NOT ok; no target or home adopted.")
+                log(f"arm {channel} ({side}) NO FEEDBACK: CAN RX counter "
+                    f"unreadable or not increasing (rx {rx0} -> {rx1} in 2 s); "
+                    f"failing closed; no target or home adopted.")
                 return
             self.ok = True
-            self._read_measured()
+            self._read_measured(latch=False)
+            if not feedback_sane(self._measured):
+                self.ok = False
+                self._meas_ok = False
+                log(f"arm {channel} ({side}) NO FEEDBACK: unusable/all-zero "
+                    f"joints {self._measured!r}; failing closed; no home adopted.")
+                return
             # Record what the arm says it is in, so /api/status reports the
             # hardware truth from the first second rather than "not verified".
-            self.mode_actual = self._read_actual_mode()
+            self._note_mode(self._read_actual_mode())
             # Adopt whatever the arm is already doing as our starting intent, so
             # an arm left enabled by a previous session is usable immediately.
             self.enabled = any(self.joints_enabled)
@@ -557,12 +1016,18 @@ class ArmBridge:
         except Exception as e:
             log(f"arm {channel} FAILED: {e!r}")
 
-    def _read_measured(self):
+    def _read_measured(self, latch=True):
         try:
             js = self.iface.GetArmJointMsgs().joint_state
             raw = [js.joint_1, js.joint_2, js.joint_3, js.joint_4, js.joint_5, js.joint_6]
             self._measured = [v * 0.001 for v in raw]
+            if not feedback_sane(self._measured):
+                self._meas_ok = False
+                if latch and self.ok:
+                    self._latch_feedback_fault("invalid/all-zero joint feedback")
+                return
             self._meas_ok = True
+            self._last_feedback = time.monotonic()
             st = self.iface.GetArmEnableStatus()
             self.joints_enabled = [bool(x) for x in st][:6]
             # NOTE: this does NOT touch self.enabled. self.enabled is the user's
@@ -574,9 +1039,41 @@ class ArmBridge:
             g = self.iface.GetArmGripperMsgs()
             gs = getattr(g, "gripper_state", None)
             if gs is not None:
-                self.gripper = getattr(gs, "grippers_angle", 0) * 0.001
+                g = getattr(gs, "grippers_angle", 0) * 0.001
+                if math.isfinite(g):
+                    self.gripper = g
         except Exception:
             self._meas_ok = False
+
+    def feedback_ok(self):
+        """True only when fresh, finite, non-degenerate joint feedback exists."""
+        last = getattr(self, "_last_feedback", 0.0)
+        if not self._meas_ok or not last:
+            return False
+        age = time.monotonic() - last
+        if not (0.0 <= age <= FEEDBACK_STALE_S):
+            return False
+        return feedback_sane(self._measured)
+
+    def _latch_feedback_fault(self, reason):
+        """Stop special modes on hardware, then stop our stream.
+
+        Ordinary MOVE J is held by simply not sending JointCtrl/Gripper frames;
+        we deliberately do NOT call DisableArm (a raised arm must not drop).
+        teaching/master-slave/MOVE C are hardware-side modes and must be stopped
+        with the SDK's documented stop frames; MOVE C falls back to DisableArm
+        only if the stop frame itself fails.
+        """
+        if getattr(self, "_feedback_fault", False):
+            with self.lock:
+                self.enabled = False
+            return
+        self.cancel_motion_hold("feedback fault: " + reason)
+        with self.lock:
+            self.enabled = False
+            self._feedback_fault = True
+        log(f"arm {self.side}: FEEDBACK FAULT ({reason}); special modes stopped, "
+            f"output disabled, reset/enable required")
 
     def _refresh_faults(self):
         """Per-motor driver faults (overheat / driver error). Read-only."""
@@ -610,22 +1107,23 @@ class ArmBridge:
         """
         n = 0
         last_mode = 0.0
-        t_start = time.time()
+        t_start = time.monotonic()
         while not self._stop.is_set():
-            t0 = time.time()
+            t0 = time.monotonic()
             n += 1
+            if self.enabled and not self.feedback_ok():
+                self._latch_feedback_fault("feedback stale")
             if self.enabled:
                 # Advance a playing trajectory first: it is a TARGET SOURCE, so
-                # it has to update self.joints before the frame goes out.
-                self._advance_trajectory(t0)
-                # Re-assert the ACTIVE mode periodically. Sending it only at
-                # enable time is NOT enough: an arm that was already enabled
-                # (e.g. left enabled by an earlier session) never received it,
-                # stayed in its previous mode, and moved a fraction of a degree
-                # before stalling short of the target. That was a real bug.
-                # 10s rather than 2s: each re-assert briefly re-enters the mode,
-                # which is itself a small disturbance.
-                if t0 - last_mode > 10.0:
+                # it has to update self.joints before the frame goes out. Do not
+                # do this while teaching/master-slave owns the arm.
+                if not self.teaching and not self.master_slave["enabled"]:
+                    self._advance_trajectory(t0)
+                # Re-assert the ACTIVE mode periodically - but NOT while
+                # teaching/master-slave is active: a MotionCtrl_2 frame there
+                # fights the operator or the linkage.
+                if (not self.teaching and not self.master_slave["enabled"]
+                        and t0 - last_mode > 10.0):
                     last_mode = t0
                     try:
                         self._apply_mode()
@@ -682,19 +1180,27 @@ class ArmBridge:
                         self.error_code = 1
                         if n % 200 == 0:
                             log(f"arm stream error: {e!r}")
-            elapsed = time.time() - t_start
+            elapsed = time.monotonic() - t_start
             if elapsed > 0:
                 self.cmd_hz = round(n / elapsed, 1)
-            dt = time.time() - t0
+            dt = time.monotonic() - t0
             time.sleep(max(0.0, (1.0 / self.RATE_HZ) - dt))
 
     def _feedback_loop(self):
         """5 Hz: read joints / enable / faults / gripper, off the control path."""
         n = 0
         t_start = time.time()
+        last_mode = 0.0
         while not self._stop.is_set():
             n += 1
             self._read_measured()
+            now = time.time()
+            # mode_actual used to be frozen at the last mode change. Re-read it
+            # here (a separate thread, so the 50 Hz command stream is untouched)
+            # so an arm that silently reverted to its own planner is visible.
+            if now - last_mode >= MODE_POLL_S:
+                last_mode = now
+                self._note_mode(self._read_actual_mode())
             elapsed = time.time() - t_start
             if elapsed > 0:
                 self.feedback_hz = round(n / elapsed, 1)
@@ -710,7 +1216,7 @@ class ArmBridge:
         interrupted a move) the arm sits and fights it. Re-syncing makes the arm
         hold still. Deliberately causes no motion.
         """
-        if not self.ok:
+        if not self.ok or not self.feedback_ok():
             return False
         try:
             # 0x02 = resume (0x01 = stop, 0x00 = invalid/no-op)
@@ -723,21 +1229,30 @@ class ArmBridge:
             with self.lock:
                 self.joints = list(self._measured)
                 self._grip_target = self.gripper
-            self.set_enabled(True)
+            enabled = self.set_enabled(True)
             self._read_measured()
+            if enabled:
+                self._feedback_fault = False
             log(f"arm {self.channel} reset: joints={[round(v,2) for v in self._measured]} "
                 f"enabled={self.enabled} per-joint={self.joints_enabled}")
-            return True
+            return bool(enabled)
         except Exception as e:
             log(f"arm {self.channel} reset failed: {e!r}")
             return False
 
     def go_home(self):
-        """Command the arm back to the pose it held when the server started."""
-        if not self.ok:
+        """Command the arm toward the pose it held when the server started.
+
+        The target is bounded by the same 15 deg measured-angle envelope as
+        every other move, so a Home press while the arm is far away moves at
+        most MAX_TARGET_LAG_DEG; press it again to continue. The endpoint
+        reports `lag_limited` so the UI can say so.
+        """
+        if (not self.ok or not self.feedback_ok()
+                or getattr(self, "_feedback_fault", False)):
             return None
         with self.lock:
-            self.joints = [clamp(self.home_deg[i], self.limits[i][0], self.limits[i][1])
+            self.joints = [self._clamp_target_to_lag(i, self.home_deg[i])
                            for i in range(6)]
             target = list(self.joints)
         log(f"arm {self.channel} homing to {[round(v,2) for v in target]}")
@@ -753,6 +1268,8 @@ class ArmBridge:
         the unresponsive Enable button presented.
         """
         if not self.ok:
+            return False
+        if on and not self.feedback_ok():
             return False
         try:
             if on:
@@ -804,15 +1321,13 @@ class ArmBridge:
                 # targets into an arm that is still in MOVE_P makes it fight its
                 # own planner. That is exactly the 2026-10-29 shaking incident,
                 # so check what the ARM says rather than trusting the bookkeeping.
-                expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
-                          "movec": "MOVE_C", "mit": "MOVE_J"}.get(self.mode, "MOVE_J")
+                expect = self._expected_mode_actual(self.mode)
                 actual = self._read_actual_mode()
                 if actual is not None and actual != expect:
                     self._apply_mode()
                     time.sleep(0.35)
                     actual = self._read_actual_mode()
-                self.mode_actual = actual
-                self.mode_verified = actual is None or actual == expect
+                self._note_mode(actual, expect)
                 if not self.mode_verified:
                     log(f"arm {self.side} enabled but arm reports {actual}, "
                         f"expected {expect} - re-asserted the mode; verify before use")
@@ -834,13 +1349,29 @@ class ArmBridge:
                         self.iface.DisableArm(motor_num=7)
                     except Exception:
                         pass
-            # Record the INTENT. self.enabled drives the control loop and is
-            # reported (ANDed with the measured state); joints_enabled is purely
-            # what the hardware says. Forgetting this made Enable report false
-            # even though all six motors had come up.
+            # Record the INTENT separately from the hardware truth. self.enabled
+            # drives the control loop; state() reports enable_requested (intent)
+            # and enabled (any motor live) independently, because they can
+            # disagree. The return value is the VERIFIED motor result, not "the
+            # request was sent": telling the caller ok while 0/6 motors came up
+            # is the false-success bug this replaces.
             self.enabled = bool(on)
-            log(f"arm {self.channel} enabled={self.enabled} per-joint={self.joints_enabled}")
-            return True
+            motors = sum(1 for x in self.joints_enabled if x)
+            verified = (motors > 0) if on else (motors == 0)
+            if on and not self.mode_verified:
+                # Motors may be live but the arm is not in the mode we think it
+                # is. Do not stream into it; require an explicit reset/enable.
+                self.enabled = False
+                verified = False
+                log(f"arm {self.side} enable NOT verified: arm reports "
+                    f"{self.mode_actual}, expected "
+                    f"{self._expected_mode_actual(self.mode)}; output disabled")
+            elif on and verified:
+                self._feedback_fault = False
+            log(f"arm {self.channel} enabled={self.enabled} "
+                f"motors={motors}/6 verified={verified} "
+                f"mode_verified={self.mode_verified} per-joint={self.joints_enabled}")
+            return bool(verified)
         except Exception as e:
             log(f"arm enable failed: {e!r}")
             return False
@@ -907,6 +1438,26 @@ class ArmBridge:
             pass
         return None
 
+    @staticmethod
+    def _expected_mode_actual(mode):
+        return {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
+                "movec": "MOVE_C", "mit": "MOVE_J"}.get(mode, "MOVE_J")
+
+    def _note_mode(self, actual, expect=None):
+        """Record what the arm said, and only call it verified with a reading.
+
+        mode_verified used to be True when GetArmStatus could not be read at all
+        (actual is None), which is the opposite of verified. A missing reading
+        now means unverified.
+        """
+        self.mode_actual = actual
+        self._last_mode_check = time.monotonic()
+        if actual is None:
+            self.mode_verified = False
+        else:
+            self.mode_verified = (actual == (expect or
+                                             self._expected_mode_actual(self.mode)))
+
     def set_mode(self, mode):
         """Switch control law. Resyncs the target to measured first.
 
@@ -916,8 +1467,14 @@ class ArmBridge:
         """
         if not self.ok:
             return False
+        if self.enabled and (not self.feedback_ok()
+                             or getattr(self, "_feedback_fault", False)):
+            return False
         mode = str(mode or "").strip()
         if mode not in self.MODES:
+            return False
+        if mode == "movec" and not ENABLE_MOVEC:
+            log(f"arm {self.side} MOVE C refused: AGILEX_ENABLE_MOVEC is not set")
             return False
         if mode == self.mode:
             return True
@@ -928,8 +1485,7 @@ class ArmBridge:
         old, self.mode = self.mode, mode
         ok = self._apply_mode()
         # Believe the hardware, not ourselves. One retry, then revert.
-        expect = {"pos_j": "MOVE_J", "pos_p": "MOVE_P",
-                  "movec": "MOVE_C", "mit": "MOVE_J"}[mode]
+        expect = self._expected_mode_actual(mode)
         actual = None
         for attempt in (1, 2):
             time.sleep(0.35)
@@ -939,21 +1495,35 @@ class ArmBridge:
             log(f"arm {self.side} mode {mode}: arm still reports {actual} "
                 f"(attempt {attempt}), re-sending")
             self._apply_mode()
-        self.mode_actual = actual
-        if actual is not None and actual != expect:
+        self._note_mode(actual, expect)
+        if actual is None:
+            # Do not keep streaming the new control law when the arm did not
+            # confirm it. Revert bookkeeping and stop output until an explicit
+            # enable verifies the mode.
+            self.mode = old
+            self.enabled = False
+            log(f"arm {self.side} mode {mode}: could not read the arm's mode "
+                f"back; reverted to {old} and disabled output; reset/enable required")
+            return False
+        if actual != expect:
             back = {"MOVE_J": "pos_j", "MOVE_P": "pos_p", "MOVE_C": "movec"}
             self.mode = back.get(actual, "pos_j")
-            self.mode_verified = False
+            self.enabled = False
             log(f"arm {self.side} mode {mode} REJECTED by the arm (it is in "
-                f"{actual}); bookkeeping reverted to {self.mode} so we do not "
-                f"stream into the wrong mode")
+                f"{actual}); bookkeeping reverted to {self.mode}, output disabled")
             return False
-        self.mode_verified = True
         log(f"arm {self.side} mode {old} -> {mode} (arm reports {actual}, sent={ok})")
-        return ok
+        return bool(ok and self.mode_verified)
 
     def set_mit(self, kp=None, kd=None, t_ref=None):
         """Set MIT impedance gains. Per-joint lists or scalars, 6 motors."""
+        err = validate_mit_gains(kp, kd, t_ref)
+        if err:
+            log(f"arm {self.side} MIT gains refused: {err}")
+            return {"ok": False, "error": err,
+                    "kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
+                    "t_ref": list(self.mit["t_ref"])}
+
         def _six(v, cur):
             if v is None:
                 return list(cur)
@@ -966,7 +1536,8 @@ class ArmBridge:
             self.mit["kp"] = _six(kp, self.mit["kp"])
             self.mit["kd"] = _six(kd, self.mit["kd"])
             self.mit["t_ref"] = _six(t_ref, self.mit["t_ref"])
-            return {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
+            return {"ok": True,
+                    "kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
                     "t_ref": list(self.mit["t_ref"])}
 
     def run_movec(self, points):
@@ -980,6 +1551,12 @@ class ArmBridge:
         """
         if not self.ok:
             return {"ok": False, "error": "arm not connected"}
+        if not ENABLE_MOVEC:
+            return {"ok": False,
+                    "error": "MOVE C is disabled by default; set AGILEX_ENABLE_MOVEC=1 "
+                             "after a risk assessment"}
+        if not self.enabled or not any(self.joints_enabled):
+            return {"ok": False, "error": "arm is disabled"}
         try:
             pts = [[int(round(float(v))) for v in p[:6]] for p in (points or [])]
         except Exception as e:
@@ -987,6 +1564,13 @@ class ArmBridge:
         if len(pts) != 3:
             return {"ok": False,
                     "error": "MOVE C needs exactly 3 points (start, via, end)"}
+        # Units are 0.001 mm / 0.001 deg. Reject points that cannot be on this
+        # arm's 0.8 m reach instead of letting the controller discover it.
+        for p in pts:
+            if any(abs(v) > 2_000_000 for v in p[:3]):
+                return {"ok": False, "error": "MOVE C point outside +/-2 m"}
+            if any(abs(v) > 360_000 for v in p[3:]):
+                return {"ok": False, "error": "MOVE C orientation outside +/-360 deg"}
         try:
             self.iface.MoveCAxisUpdateCtrl(0x03)     # clear any previous arc
             time.sleep(0.1)
@@ -1010,13 +1594,21 @@ class ArmBridge:
     def load_trajectory(self, name, points, dt=0.05):
         """Load a joint trajectory: points = [[6 deg], ...], dt seconds/frame."""
         try:
-            pts = [[clamp(float(v), self.limits[j][0], self.limits[j][1])
-                    for j, v in enumerate(p[:6])] for p in (points or [])]
+            pts = []
+            for p in (points or []):
+                vals = [float(v) for v in list(p)[:6]]
+                if len(vals) < 6 or not all(math.isfinite(v) for v in vals):
+                    return {"ok": False, "error": "bad points: need 6 finite angles"}
+                pts.append([clamp(vals[j], self.limits[j][0], self.limits[j][1])
+                            for j in range(6)])
         except Exception as e:
             return {"ok": False, "error": f"bad points: {e!r}"}
         if len(pts) < 2:
             return {"ok": False, "error": "need at least 2 points"}
-        dt = max(0.01, min(float(dt), 1.0))
+        dt = finite_float(dt)
+        if dt is None:
+            return {"ok": False, "error": "dt must be finite"}
+        dt = max(0.01, min(dt, 1.0))
         with self.lock:
             self.traj.update({"name": str(name or "unnamed"), "points": pts,
                               "dt": dt, "idx": 0, "playing": False,
@@ -1034,6 +1626,16 @@ class ArmBridge:
         return self.load_trajectory(name, pts, dt if dt else file_dt)
 
     def play_trajectory(self, loop=False, speed=1.0):
+        if (not self.ok or not self.feedback_ok()
+                or getattr(self, "_feedback_fault", False)):
+            return {"ok": False,
+                    "error": "feedback stale; reset/enable required before replay"}
+        try:
+            speed = float(speed)
+        except Exception:
+            return {"ok": False, "error": "bad speed"}
+        if not math.isfinite(speed):
+            return {"ok": False, "error": "speed must be finite"}
         with self.lock:
             if not self.traj["points"]:
                 return {"ok": False, "error": "no trajectory loaded"}
@@ -1043,7 +1645,7 @@ class ArmBridge:
             self.traj.update({"playing": True, "loop": bool(loop),
                               "idx": 0, "plays": 0,
                               "speed": max(0.1, min(float(speed), 4.0)),
-                              "t_next": time.time()})
+                              "t_next": time.monotonic()})
             self.teaching = False
         log(f"arm {self.side} trajectory play: {self.traj['name']} "
             f"loop={loop} speed={speed}")
@@ -1105,6 +1707,10 @@ class ArmBridge:
         """
         if not self.ok:
             return {"ok": False, "error": "arm not connected"}
+        if (on or execute) and (not self.feedback_ok()
+                                or getattr(self, "_feedback_fault", False)):
+            return {"ok": False,
+                    "error": "feedback stale; reset/enable required before teach"}
         try:
             if on:
                 with self.lock:
@@ -1140,6 +1746,10 @@ class ArmBridge:
         """
         if not self.ok:
             return {"ok": False, "error": "arm not connected"}
+        if on and (not self.feedback_ok()
+                   or getattr(self, "_feedback_fault", False)):
+            return {"ok": False,
+                    "error": "feedback stale; reset/enable required before master/slave"}
         try:
             if on:
                 cfg = 0xFA if role == "leader" else 0xFC
@@ -1167,16 +1777,45 @@ class ArmBridge:
             log(f"arm {self.side} master/slave failed: {e!r}")
             return {"ok": False, "error": repr(e)}
 
+    def _clamp_target_to_lag(self, joint, want):
+        """Clamp a requested angle to the joint limit AND the 15 deg envelope
+        around the measured angle. Caller holds self.lock.
+
+        nudge() and trajectory advance already had this guard; absolute targets
+        and Home did not, so a single request could command a 100 deg jump. A
+        destination is still a destination - it just cannot be further than
+        MAX_TARGET_LAG_DEG from where the arm actually is.
+        """
+        lo, hi = self.limits[joint]
+        meas = self._measured[joint]
+        try:
+            want = float(want)
+        except Exception:
+            want = meas
+        if not math.isfinite(want):
+            want = meas
+        want = clamp(want, lo, hi)
+        if not math.isfinite(meas):
+            return want
+        lower = max(lo, meas - MAX_TARGET_LAG_DEG)
+        upper = min(hi, meas + MAX_TARGET_LAG_DEG)
+        if lower > upper:
+            # Measured is further than MAX_TARGET_LAG from a valid range.
+            # Never build an inverted interval; hold at the nearest limit.
+            return clamp(meas, lo, hi)
+        return clamp(want, lower, upper)
+
     def set_target(self, joints_deg=None, joint=None, deg=None):
         """
         ABSOLUTE target control, as opposed to the incremental nudge().
 
-        Clamped to the documented joint limits but NOT to the 2 deg step - a
-        target is a destination, not a jog. The arm's own `move_spd_rate_ctrl`
-        still bounds how fast it gets there, so a large target is not a large
-        jerk.
+        Clamped to the documented joint limits and to the same 15 deg measured-
+        angle envelope as nudge(). A large destination therefore takes several
+        requests; that is intentional, because the old behaviour let one HTTP
+        call command a 100 deg jump.
         """
-        if not self.ok:
+        if (not self.ok or not self.feedback_ok()
+                or getattr(self, "_feedback_fault", False)):
             return None
         with self.lock:
             if joints_deg is not None:
@@ -1184,15 +1823,19 @@ class ArmBridge:
                     vals = [float(v) for v in joints_deg][:6]
                 except Exception:
                     return None
-                if len(vals) < 6:
+                if len(vals) < 6 or not all(math.isfinite(v) for v in vals):
                     return None
-                self.joints = [clamp(vals[i], self.limits[i][0], self.limits[i][1])
+                self.joints = [self._clamp_target_to_lag(i, vals[i])
                                for i in range(6)]
             elif joint is not None and deg is not None:
-                j = int(joint)
-                if not (0 <= j <= 5):
+                try:
+                    j = int(joint)
+                    want = float(deg)
+                except Exception:
                     return None
-                self.joints[j] = clamp(float(deg), self.limits[j][0], self.limits[j][1])
+                if not (0 <= j <= 5) or not math.isfinite(want):
+                    return None
+                self.joints[j] = self._clamp_target_to_lag(j, want)
             else:
                 return None
             return list(self.joints)
@@ -1216,9 +1859,16 @@ class ArmBridge:
              measured angle. If the arm cannot keep up, the target is pulled back
              rather than allowed to run away.
         """
-        if not self.ok or not (0 <= joint <= 5):
+        if (not self.ok or not (0 <= joint <= 5) or not self.feedback_ok()
+                or getattr(self, "_feedback_fault", False)):
             return None
-        delta_deg = clamp(float(delta_deg), -MAX_JOINT_STEP_DEG, MAX_JOINT_STEP_DEG)
+        try:
+            delta_deg = float(delta_deg)
+        except Exception:
+            return None
+        if not math.isfinite(delta_deg):
+            return None
+        delta_deg = clamp(delta_deg, -MAX_JOINT_STEP_DEG, MAX_JOINT_STEP_DEG)
         lo, hi = self.limits[joint]
         with self.lock:
             measured = self._measured[joint]
@@ -1237,25 +1887,55 @@ class ArmBridge:
             return list(self.joints)
 
     def nudge_gripper(self, delta_deg):
-        if not self.ok:
+        if (not self.ok or not self.feedback_ok()
+                or getattr(self, "_feedback_fault", False)):
+            return None
+        try:
+            delta_deg = float(delta_deg)
+        except Exception:
+            return None
+        if not math.isfinite(delta_deg):
             return None
         with self.lock:
             # Piper gripper: 0 = closed, ~70 deg = fully open
-            self._grip_target = clamp(self._grip_target + float(delta_deg), 0.0, 70.0)
+            self._grip_target = clamp(self._grip_target + delta_deg, 0.0, 70.0)
             return self._grip_target
 
     def state(self):
         with self.lock:
             target = [round(v, 3) for v in self.joints]
+        now = time.monotonic()
+        last_feedback = getattr(self, "_last_feedback", 0.0)
+        last_mode = getattr(self, "_last_mode_check", 0.0)
+        age = (now - last_feedback) if last_feedback else None
+        feedback_ok = self.feedback_ok()
+        motors = sum(1 for x in self.joints_enabled if x)
+        mode_age = (now - last_mode) if last_mode else None
+        mode_verified = bool(self.mode_verified and self.mode_actual is not None
+                             and mode_age is not None
+                             and mode_age <= MODE_STALE_S)
         return {
             "side": self.side,
             "can": self.channel,
-            "connected": self.ok,
-            # "enabled" = intent AND reality, so a motor that dropped out on its
-            # own still shows as not-enabled rather than silently claiming ok.
-            "enabled": bool(self.enabled and any(self.joints_enabled)),
+            # connected now means "the bus was alive at startup AND feedback is
+            # still arriving". It used to latch at startup, so a bus that died
+            # later still showed connected with frozen joint angles.
+            "connected": bool(self.ok and feedback_ok),
+            "feedback_ok": feedback_ok,
+            "feedback_fault": bool(getattr(self, "_feedback_fault", False)),
+            "feedback_age_s": None if age is None else round(age, 2),
+            # "enabled" is now the HARDWARE truth (at least one motor live);
+            # enable_requested is what the operator asked for. They can differ:
+            # a motor that refused to drop still leaves the arm energized even
+            # though the UI asked for disable. Neither is a substitute for
+            # joints_enabled; enabled_all is the stricter 6/6 form.
+            "enabled": bool(motors > 0),
+            "enabled_all": bool(motors == 6),
+            "enable_requested": bool(self.enabled),
+            "motors_enabled": motors,
             "firmware": self.firmware,
-            "joints_deg": [round(v, 3) for v in self._measured],
+            "joints_deg": [round(v, 3) if math.isfinite(v) else None
+                           for v in self._measured],
             "targets_deg": target,
             "joints_enabled": list(self.joints_enabled),
             "faults": [list(f) for f in self.faults],
@@ -1271,7 +1951,8 @@ class ArmBridge:
             # ---- operating mode ----
             "mode": self.mode,
             "mode_actual": self.mode_actual,
-            "mode_verified": self.mode_verified,
+            "mode_verified": mode_verified,
+            "mode_age_s": None if mode_age is None else round(mode_age, 2),
             "teaching": self.teaching,
             "mit": {"kp": list(self.mit["kp"]), "kd": list(self.mit["kd"]),
                     "t_ref": list(self.mit["t_ref"])},
@@ -1287,8 +1968,63 @@ class ArmBridge:
             "master_slave": dict(self.master_slave),
         }
 
+    def cancel_motion_hold(self, reason="lease changed"):
+        """Cancel continuous motion sources and hold at measured.
+
+        Plain MOVE J only stops our stream; dropping torque on a raised arm is
+        more dangerous than holding position. Hardware-side modes (drag teach,
+        master/slave, MOVE C) get their documented stop frame. MOVE C is the
+        only case that may fall back to DisableArm, and only if its stop frame
+        itself fails. Each stop is attempted independently so one failed frame
+        cannot leave another mode running.
+        """
+        was_teaching = bool(self.teaching)
+        was_ms = bool(self.master_slave.get("enabled"))
+        was_movec = bool(self.movec.get("active"))
+        with self.lock:
+            self.traj["playing"] = False
+            self.traj["idx"] = 0
+            self.teaching = False
+            self.master_slave = {"enabled": False, "role": None}
+            self.movec["active"] = False
+            self._last_posp_sent = None
+            if self.feedback_ok():
+                self._resync_target_locked()
+        if self.iface:
+            if was_teaching:
+                try:
+                    self.iface.MotionCtrl_1(emergency_stop=0x00,
+                                            track_ctrl=0x00,
+                                            grag_teach_ctrl=0x02)
+                except Exception as e:
+                    log(f"arm {self.side} teach stop failed: {e!r}")
+            if was_ms:
+                try:
+                    self.iface.MasterSlaveConfig(linkage_config=0x00,
+                                                 feedback_offset=0x00,
+                                                 ctrl_offset=0x00,
+                                                 linkage_offset=0x00)
+                except Exception as e:
+                    log(f"arm {self.side} master/slave stop failed: {e!r}")
+            if was_movec:
+                # MotionCtrl_1(emergency_stop=0x01) is the documented "stop"
+                # (0x02 is resume).  This is the only reliable way to abort an
+                # already-dispatched MOVE C arc; if the frame itself fails,
+                # DisableArm is the permitted last resort.
+                try:
+                    self.iface.MotionCtrl_1(emergency_stop=0x01,
+                                            track_ctrl=0x00,
+                                            grag_teach_ctrl=0x00)
+                except Exception:
+                    try:
+                        self.iface.DisableArm(motor_num=7)
+                    except Exception:
+                        pass
+        log(f"arm {self.side}: motion cancelled ({reason}); holding measured pose")
+
     def estop(self):
         try:
+            self.cancel_motion_hold("E-STOP")
             self.enabled = False
             if self.iface:
                 self.iface.DisableArm(motor_num=7)
@@ -1300,9 +2036,14 @@ class ArmBridge:
 # MJPEG streaming
 # ----------------------------------------------------------------------------
 def ffmpeg_cmd(dev):
+    input_format = "mjpeg"
+    for cam, configured_dev in VIDEO_DEV.items():
+        if configured_dev == dev:
+            input_format = os.environ.get(f"AGILEX_CAM{cam}_INPUT_FORMAT", "mjpeg")
+            break
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "v4l2", "-input_format", "mjpeg",
+        "-f", "v4l2", "-input_format", input_format,
         "-video_size", f"{VIDEO_W}x{VIDEO_H}",
         # Ask the DEVICE for the low rate, not just the output. Without this the
         # camera runs its maximum mode (30 fps) and reserves USB bandwidth for
@@ -1319,7 +2060,7 @@ FRAME_TIMEOUT_S = 8.0
 FRAME_HOLD_S = float(os.environ.get("AGILEX_FRAME_HOLD", "30"))
 
 # A camera that has just been opened can take much longer than FRAME_TIMEOUT_S
-# to deliver its first frame. Measured on this robot: cam2 (right arm) needs
+# to deliver its first frame. Measured on this robot: cam2 (left arm) needs
 # around 9 seconds to cold-start, especially when the other camera is opening at
 # the same moment on the same USB bus. Using the steady-state timeout for the
 # FIRST frame made a fresh viewer give up before the camera was ready, which
@@ -1577,6 +2318,58 @@ class FrameHub:
         log(f"hub {self.dev}: stopped")
 
 
+class HttpFrameHub(FrameHub):
+    """Share a loopback JPEG endpoint without opening the V4L2 device twice."""
+
+    def __init__(self, url, poll_hz=12, timeout=2.0):
+        super().__init__(url)
+        self.period = 1.0 / max(1.0, float(poll_hz))
+        self.timeout = float(timeout)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _pump(self):
+        while not self._stop.is_set():
+            with self._cond:
+                while self._refs == 0 and not self._stop.is_set():
+                    self._cond.wait(0.5)
+                if self._stop.is_set():
+                    return
+            n = 0
+            t0 = time.monotonic()
+            try:
+                while self._refs and not self._stop.is_set():
+                    try:
+                        with self._opener.open(self.dev, timeout=self.timeout) as response:
+                            jpg = response.read()
+                        if not (jpg.startswith(b"\xff\xd8") and jpg.endswith(b"\xff\xd9")):
+                            raise ValueError("invalid JPEG from global camera")
+                        with self._cond:
+                            if jpg != self._latest:
+                                n += 1
+                                self._latest = jpg
+                                self._seq += 1
+                                elapsed = time.monotonic() - t0
+                                if elapsed > 0:
+                                    self.fps = n / elapsed
+                                self._cond.notify_all()
+                            self._err = None
+                    except Exception as e:
+                        self._err = repr(e)
+                    with self._cond:
+                        if self._refs == 0:
+                            self._latest = None
+                            self._seq = 0
+                            self._cond.notify_all()
+                    time.sleep(self.period)
+            finally:
+                with self._cond:
+                    if self._refs == 0:
+                        self._latest = None
+                        self._seq = 0
+                        self._cond.notify_all()
+            time.sleep(0.4)
+
+
 # ----------------------------------------------------------------------------
 # Shared control state
 # ----------------------------------------------------------------------------
@@ -1591,25 +2384,91 @@ class Control:
         self.last_drive = 0.0
         self.estop = False
         self.started = time.time()
+        self.leases = LeaseStore()
+        _lease = self.leases.status()
+        self._lease_generation = _lease.get("generation", 0)
+        self._lease_held = bool(_lease.get("held"))
+        self._lease_controller = _lease.get("controller")
         threading.Thread(target=self._drive_loop, daemon=True).start()
+        threading.Thread(target=self._lease_watch_loop, daemon=True).start()
+
+    def _cancel_arm_motion(self, reason):
+        for a in self.arms:
+            try:
+                a.cancel_motion_hold(reason)
+            except Exception as e:
+                log(f"cancel_motion_hold failed on {getattr(a, 'side', '?')}: {e!r}")
+
+    def _lease_check(self):
+        """Stop old motion when the lease is released, expires, or changes holder.
+
+        A first acquire (free -> held) deliberately does NOT cancel: the operator
+        usually takes the lease and then starts a trajectory, and cancelling here
+        would kill motion that was started a moment earlier.
+        """
+        st = self.leases.status()
+        gen = st.get("generation", 0)
+        held = bool(st.get("held"))
+        controller = st.get("controller")
+        prev_held = self._lease_held
+        prev_controller = getattr(self, "_lease_controller", None)
+        cancel = False
+        reason = ""
+        if prev_held and not held:
+            cancel = True
+            reason = "control lease expired or released"
+        elif prev_held and held and controller != prev_controller:
+            cancel = True
+            reason = "control lease taken over"
+        elif gen > self._lease_generation + 1:
+            # Release and re-acquire both happened between two polls; the old
+            # holder's motion must not survive that.
+            cancel = True
+            reason = "control lease changed hands between polls"
+        self._lease_generation = gen
+        self._lease_held = held
+        self._lease_controller = controller
+        if cancel:
+            self._cancel_arm_motion(reason)
+            self.zero()
+            self.ros.publish(0.0, 0.0)
+            log(f"{reason}; old arm motion cancelled and chassis zeroed")
+
+    def _lease_watch_loop(self):
+        while True:
+            try:
+                self._lease_check()
+            except Exception as e:
+                log(f"lease watchdog error: {e!r}")
+            time.sleep(0.2)
 
     def _drive_loop(self):
         """20 Hz. This is where the watchdog actually enforces 'stop'."""
         while True:
             with self.lock:
-                stale = (time.time() * 1000 - self.last_drive) > WATCHDOG_MS
+                stale = self._drive_stale()
                 lin, ang = (0.0, 0.0) if (stale or self.estop) else (self.lin, self.ang)
             self.ros.publish(lin, ang)
             time.sleep(0.05)
 
+    def _drive_stale(self, now_ms=None):
+        """Monotonic watchdog: wall-clock jumps cannot extend the last Twist."""
+        if now_ms is None:
+            now_ms = time.monotonic() * 1000.0
+        return (now_ms - self.last_drive) > WATCHDOG_MS
+
     def drive(self, lin, ang):
-        lin = clamp(float(lin), -MAX_LIN, MAX_LIN)
-        ang = clamp(float(ang), -MAX_ANG, MAX_ANG)
+        lin = float(lin)
+        ang = float(ang)
+        if not (math.isfinite(lin) and math.isfinite(ang)):
+            return None
+        lin = clamp(lin, -MAX_LIN, MAX_LIN)
+        ang = clamp(ang, -MAX_ANG, MAX_ANG)
         with self.lock:
             if self.estop:
                 return (0.0, 0.0)
             self.lin, self.ang = lin, ang
-            self.last_drive = time.time() * 1000
+            self.last_drive = time.monotonic() * 1000.0
         return (lin, ang)
 
     def zero(self):
@@ -1677,13 +2536,17 @@ class Control:
             "arms": arms,
             "limits": {"max_lin": MAX_LIN, "max_ang": MAX_ANG,
                        "max_joint_step_deg": MAX_JOINT_STEP_DEG,
+                       "max_target_lag_deg": MAX_TARGET_LAG_DEG,
                        # Where the slider should start, vs. what is allowed.
                        "default_lin": DEFAULT_LIN, "default_ang": DEFAULT_ANG,
+                       # MOVE C is opt-in; the UI disables the option when false.
+                       "movec_enabled": ENABLE_MOVEC,
                        # The hardware ceiling, so the UI can show what the
                        # chassis is actually capable of next to the safe default.
                        "hw_max_lin": HW_MAX_LIN, "hw_max_ang": HW_MAX_ANG,
                        "hw_max_source": HW_MAX_SOURCE},
             "estop": es,
+            "lease": self.leases.status(),
             "watchdog_ms": WATCHDOG_MS,
         }
 
@@ -1710,12 +2573,13 @@ class EpisodeRecorder:
     Layout, one directory per episode:
         episode_0001/
             meta.json      task, notes, timing, outcome, counts
-            cam0/000001.jpg ...   left arm camera
-            cam2/000001.jpg ...   right arm camera
+            cam0/000001.jpg ...   right wrist camera
+            cam2/000001.jpg ...   left wrist camera
+            cam4/000001.jpg ...   optional global Logitech BRIO
             timeline.csv   one row per tick: t, frame, joint angles, gripper,
                            commanded lin/ang, odometry
     File names are deliberately the same tick index, so a row in timeline.csv
-    and the two images with that index are the same moment by construction.
+    and all configured images with that index are the same moment by construction.
     """
 
     def __init__(self, control, hubs, root=EPISODE_ROOT):
@@ -1767,8 +2631,8 @@ class EpisodeRecorder:
                 # Belt and braces: never silently clobber an existing episode.
                 return {"ok": False, "error": f"{ep} already exists and is not empty"}
             try:
-                for sub in ("cam0", "cam2"):
-                    os.makedirs(os.path.join(ep, sub), exist_ok=True)
+                for cam in self.hubs:
+                    os.makedirs(os.path.join(ep, f"cam{cam}"), exist_ok=True)
             except Exception as e:
                 return {"ok": False, "error": f"cannot create {ep}: {e}"}
 
@@ -1779,7 +2643,8 @@ class EpisodeRecorder:
                 "notes": notes,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "record_hz": RECORD_HZ,
-                "cameras": {"cam0": "left arm", "cam2": "right arm"},
+                "cameras": {f"cam{cam}": CAMERA_META.get(f"cam{cam}", f"camera {cam}")
+                            for cam in self.hubs},
                 "frames": 0,
                 "duration_s": 0.0,
                 "success": None,
@@ -1879,7 +2744,7 @@ class EpisodeRecorder:
             header += ["cmd_lin", "cmd_ang", "odom_x", "odom_y", "battery_v"]
             # Source frame counters, so a consumer can tell a genuinely new
             # camera frame from a repeated one (see the image block below).
-            header += ["cam0_seq", "cam2_seq"]
+            header += [f"cam{cam}_seq" for cam in self.hubs]
             w.writerow(header)
 
             nxt = t_start
@@ -1898,13 +2763,14 @@ class EpisodeRecorder:
                 t = time.time() - t_start
 
                 # Images: the hub holds the newest frame, which is fine at 10 Hz
-                # against a 28 Hz source. ALWAYS write both cameras, repeating the
+                # against a 28 Hz source. ALWAYS write every configured camera, repeating the
                 # previous frame if the source has not advanced - otherwise the
                 # episode is ragged (cam2 could miss 90 of 122 frames) and every
                 # consumer downstream has to handle holes. The cam*_seq columns
                 # record whether the frame was actually new.
                 seqs = {}
-                for cam, sub in ((0, "cam0"), (2, "cam2")):
+                for cam in self.hubs:
+                    sub = f"cam{cam}"
                     hub = self.hubs.get(cam)
                     jpg = hub.snapshot() if hub else None
                     seq = hub.seq_now() if hub else 0
@@ -1942,8 +2808,8 @@ class EpisodeRecorder:
                         round(float(ch.get("ang_z") or 0.0), 4),
                         round(float(ch.get("odom_x") or 0.0), 4),
                         round(float(ch.get("odom_y") or 0.0), 4),
-                        ch.get("battery_v"),
-                        seqs.get(0, 0), seqs.get(2, 0)]
+                        ch.get("battery_v")]
+                row += [seqs.get(cam, 0) for cam in self.hubs]
                 try:
                     w.writerow(row)
                 except Exception as e:
@@ -1961,6 +2827,7 @@ class Handler(BaseHTTPRequestHandler):
     control = None
     hubs = {}
     recorder = None
+    sessions = None
     ui_bytes = b"<h1>remote-ui.html not installed</h1>"
 
     def log_message(self, *a):
@@ -1972,21 +2839,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _authorised(self):
-        """Loopback is trusted (the Mac's SSH tunnel). Others must have signed in."""
-        if ALLOW_ANON or self._from_loopback():
-            return True
+    def _cookie_token(self):
         cookie = self.headers.get("Cookie") or ""
         for part in cookie.split(";"):
             k, _, v = part.strip().partition("=")
-            if k == COOKIE_NAME and v and secrets.compare_digest(v, ACCESS_TOKEN):
-                return True
-        # ?token= also works, for a bookmark or a debugging curl
-        if "?" in self.path:
-            m = re.search(r"token=([A-Za-z0-9_\-]+)", self.path.split("?", 1)[1])
-            if m and secrets.compare_digest(m.group(1), ACCESS_TOKEN):
-                return True
-        return False
+            if k == COOKIE_NAME and v:
+                return v
+        return None
+
+    def _authorised(self):
+        """Loopback is trusted (the SSH tunnel). Others need a live session."""
+        if ALLOW_ANON or self._from_loopback():
+            return True
+        token = self._cookie_token()
+        return bool(token and self.sessions is not None
+                    and self.sessions.valid(token))
 
     def _deny(self):
         log(f"denied {self.command} {self.path} from {self.client_address[0]}")
@@ -2008,14 +2875,151 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        # Audit before the body is flushed so a client that immediately reads
+        # the response also sees its audit event (tests and incident triage).
+        try:
+            self._audit_control(obj, code)
+        except Exception:
+            pass
         self.wfile.write(body)
 
+    def _bad(self, error):
+        self._json({"ok": False, "error": error}, 400)
+
     def _body(self):
+        # ThreadingHTTPServer creates one Handler per request; cache so the
+        # audit and the endpoint see the same parsed body without re-reading.
+        if hasattr(self, "_body_cache"):
+            return self._body_cache
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(n) or b"{}")
+            self._body_cache = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
-            return {}
+            self._body_cache = {}
+        return self._body_cache
+
+    def _lease_secret(self, body=None):
+        secret = (self.headers.get("X-Control-Lease") or "").strip()
+        if secret:
+            return secret
+        if isinstance(body, dict):
+            for key in ("lease", "control_lease"):
+                if body.get(key):
+                    return str(body[key])
+        return ""
+
+    def _estop_gate(self, path, body):
+        """A latched software E-STOP rejects every motion-capable endpoint.
+
+        E-STOP itself, E-STOP clear (lease+confirm checked separately), lease
+        management, recording and read-only queries stay reachable.
+        """
+        if not self.control or not self.control.estop:
+            return True
+        if path in MOTION_ENDPOINTS:
+            self._json({"ok": False,
+                        "error": "E-STOP active: motion endpoints are latched off"},
+                       423)
+            return False
+        if path == "/api/drive":
+            try:
+                zero = (abs(float(body.get("lin") or 0.0)) <= 1e-9
+                        and abs(float(body.get("ang") or 0.0)) <= 1e-9)
+            except Exception:
+                zero = False
+            if not zero:
+                self._json({"ok": False,
+                            "error": "E-STOP active: only zero drive is allowed"},
+                           423)
+                return False
+        return True
+
+    def _feedback_gate(self, path, body):
+        if not self.control:
+            return True
+        block = path in FEEDBACK_BLOCKED
+        if path == "/api/teach" and (bool(body.get("on", True))
+                                     or bool(body.get("execute", False))):
+            block = True
+        if path == "/api/master-slave" and bool(body.get("on", True)):
+            block = True
+        if not block:
+            return True
+        arm = self.control.pick_arm(body)
+        try:
+            fresh = (arm.feedback_ok() if hasattr(arm, "feedback_ok")
+                     else arm.state().get("feedback_ok", False))
+        except Exception:
+            fresh = False
+        if not fresh or getattr(arm, "_feedback_fault", False):
+            self._json({"ok": False,
+                        "error": "feedback stale or fault latched; "
+                                 "reset/enable required"}, 409)
+            return False
+        return True
+
+    def _lease_gate(self, path, body):
+        if path in LEASE_EXEMPT:
+            return True
+        if path == "/api/drive":
+            try:
+                if (abs(float(body.get("lin") or 0.0)) <= 1e-9
+                        and abs(float(body.get("ang") or 0.0)) <= 1e-9):
+                    return True
+            except Exception:
+                pass
+        secret = self._lease_secret(body)
+        if self.control and self.control.leases.check(secret):
+            return True
+        st = self.control.leases.status() if self.control else {}
+        self._json({"ok": False,
+                    "error": "control lease required or expired",
+                    "lease": st}, 409)
+        return False
+
+    def _audit_control(self, obj, code):
+        path = self.path.split("?")[0]
+        if self.command != "POST" or path in ("/api/login", "/api/logout"):
+            return
+        body = getattr(self, "_post_body", None)
+        if body is None:
+            body = self._body()
+        secret = self._lease_secret(body)
+        holder = (self.control.leases.controller_for(secret)
+                  if self.control else None)
+        if holder:
+            controller, verified = holder, True
+        else:
+            controller = (body.get("controller")
+                          if isinstance(body, dict) else None)
+            verified = False
+        # Successful non-zero drive is sampled; zero drive and any error are
+        # always recorded (the safety-relevant cases).
+        if path == "/api/drive":
+            zero = True
+            if isinstance(body, dict):
+                try:
+                    zero = (abs(float(body.get("lin") or 0.0)) <= 1e-9
+                            and abs(float(body.get("ang") or 0.0)) <= 1e-9)
+                except Exception:
+                    zero = True
+            ok = isinstance(obj, dict) and obj.get("ok") is True
+            if ok and not zero and not AUDIT.allow_drive_sample():
+                return
+        try:
+            client = self.client_address[0]
+        except Exception:
+            client = "unknown"
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "client": client,
+            "controller": clean_controller(controller),
+            "controller_verified": bool(verified),
+            "path": path,
+            "body": summarize_body(path, body),
+            "result": summarize_result(obj, code),
+        }
+        AUDIT.record(rec)
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -2043,6 +3047,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.recorder is not None:
                 st["recorder"] = self.recorder.status()
             self._json(st)
+            return
+        if path == "/api/lease/status":
+            self._json(self.control.leases.status())
             return
         if path == "/frame":
             # Single JPEG, for policy clients. /video is a multipart stream meant
@@ -2108,7 +3115,8 @@ class Handler(BaseHTTPRequestHandler):
             cam = int(m.group(1)) if m else 0
             dev = VIDEO_DEV.get(cam)
             hub = self.hubs.get(cam)
-            if not dev or not hub or not os.path.exists(dev):
+            missing_local = not dev.startswith(("http://", "https://")) and not os.path.exists(dev)
+            if not dev or not hub or missing_local:
                 self._json({"ok": False, "error": f"camera {cam} ({dev}) not present"}, 503)
                 return
             self.send_response(200)
@@ -2151,9 +3159,24 @@ class Handler(BaseHTTPRequestHandler):
         # Login must be reachable while unauthenticated.
         if path == "/api/login":
             b = self._body()
+            if not isinstance(b, dict):
+                self._bad("JSON object required")
+                return
             pw = str(b.get("password", ""))
-            if ALLOW_ANON or self._from_loopback() or \
-               (pw and secrets.compare_digest(pw, PASSWORD)):
+            # Loopback (the SSH tunnel) already authenticated the operator at
+            # the SSH layer. Do not mint a reusable network cookie for it.
+            if self._from_loopback():
+                log(f"login from loopback {self.client_address[0]}: no cookie issued")
+                self._json({"ok": True, "loopback": True})
+                return
+            if ALLOW_ANON:
+                self._json({"ok": True, "anon": True})
+                return
+            if self.sessions is None:
+                self._json({"ok": False, "error": "session store unavailable"}, 503)
+                return
+            if pw and secrets.compare_digest(pw, PASSWORD):
+                token = self.sessions.create()
                 log(f"login OK from {self.client_address[0]}")
                 body = json.dumps({"ok": True}).encode()
                 self.send_response(200)
@@ -2161,7 +3184,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Set-Cookie",
-                                 f"{COOKIE_NAME}={ACCESS_TOKEN}; Path=/; SameSite=Lax")
+                                 session_cookie(token, self.sessions.ttl))
                 self.end_headers()
                 self.wfile.write(body)
             else:
@@ -2171,12 +3194,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/logout":
+            token = self._cookie_token()
+            if token and self.sessions is not None:
+                self.sessions.revoke(token)
             body = json.dumps({"ok": True}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Set-Cookie",
-                             f"{COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax")
+            self.send_header("Set-Cookie", clear_cookie())
             self.end_headers()
             self.wfile.write(body)
             return
@@ -2184,79 +3209,230 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorised():
             self._deny()
             return
+        self._post_body = self._body()
+        # Every gate and endpoint indexes the body as a mapping. Valid JSON that
+        # is not an object (a list, string or number) used to raise inside the
+        # gate, which closed the socket instead of returning an answer.
+        if not isinstance(self._post_body, dict):
+            self._bad("JSON object required")
+            return
+        if not self._estop_gate(path, self._post_body):
+            return
+        if not self._lease_gate(path, self._post_body):
+            return
+        if not self._feedback_gate(path, self._post_body):
+            return
         c = self.control
         try:
-            if path == "/api/drive":
+            if path == "/api/lease/acquire":
+                self._json(c.leases.acquire(
+                    self._post_body.get("controller"),
+                    takeover=bool(self._post_body.get("takeover")),
+                    confirm=self._post_body.get("confirm")))
+            elif path == "/api/lease/heartbeat":
+                self._json(c.leases.heartbeat(
+                    self._lease_secret(self._post_body)))
+            elif path == "/api/lease/release":
+                self._json(c.leases.release(
+                    self._lease_secret(self._post_body)))
+            elif path == "/api/drive":
                 b = self._body()
-                lin, ang = c.drive(b.get("lin", 0.0), b.get("ang", 0.0))
-                self._json({"ok": True, "applied": {"lin": round(lin, 4), "ang": round(ang, 4)}})
+                lin = finite_float(b.get("lin", 0.0))
+                ang = finite_float(b.get("ang", 0.0))
+                if lin is None or ang is None:
+                    self._bad("lin/ang must be finite")
+                    return
+                applied = c.drive(lin, ang)
+                if applied is None:
+                    self._bad("drive rejected")
+                    return
+                lin, ang = applied
+                # The response used to say ok:true even when nothing was
+                # published: E-STOP forces (0,0), and a dead ROS bridge silently
+                # drops the Twist. Clients must see that.
+                if c.estop:
+                    err = "E-STOP active"
+                elif not getattr(c.ros, "ok", False):
+                    err = "ROS bridge unavailable"
+                else:
+                    err = None
+                self._json({"ok": err is None,
+                            "applied": {"lin": round(lin, 4), "ang": round(ang, 4)},
+                            "error": err})
             elif path == "/api/arm":
                 b = self._body()
+                try:
+                    joint = int(b.get("joint", 0))
+                except (TypeError, ValueError):
+                    joint = -1
+                delta = finite_float(b.get("delta_deg", 0.0))
+                if not (0 <= joint <= 5) or delta is None:
+                    self._bad("joint must be 0..5 and delta_deg must be finite")
+                    return
                 a = c.pick_arm(b)
-                t = a.nudge(int(b.get("joint", 0)), b.get("delta_deg", 0.0))
+                t = a.nudge(joint, delta)
                 self._json({"ok": t is not None, "targets_deg": t})
             elif path == "/api/arm/target":
                 # Absolute position control: joints_deg for a full pose, or
-                # joint+deg for a single axis.
+                # joint+deg for a single axis. The server clamps to both the
+                # joint limit and MAX_TARGET_LAG_DEG around the measured angle.
                 b = self._body()
+                if b.get("joints_deg") is not None:
+                    vals = finite_list(b.get("joints_deg"))
+                    if vals is None:
+                        self._bad("joints_deg must contain 6 finite angles")
+                        return
+                    target_args = {"joints_deg": vals}
+                elif b.get("joint") is not None and b.get("deg") is not None:
+                    try:
+                        joint = int(b.get("joint"))
+                    except (TypeError, ValueError):
+                        joint = -1
+                    deg = finite_float(b.get("deg"))
+                    if not (0 <= joint <= 5) or deg is None:
+                        self._bad("joint must be 0..5 and deg must be finite")
+                        return
+                    target_args = {"joint": joint, "deg": deg}
+                else:
+                    self._bad("joints_deg or joint+deg required")
+                    return
                 a = c.pick_arm(b)
-                t = a.set_target(joints_deg=b.get("joints_deg"),
-                                 joint=b.get("joint"), deg=b.get("deg"))
-                self._json({"ok": t is not None, "targets_deg": t})
+                t = a.set_target(**target_args)
+                limited = False
+                if t is not None:
+                    if b.get("joints_deg") is not None:
+                        try:
+                            req = [float(v) for v in b["joints_deg"]][:6]
+                            limited = any(abs(t[i] - req[i]) > 1e-6
+                                          for i in range(min(6, len(req))))
+                        except Exception:
+                            limited = False
+                    elif b.get("joint") is not None and b.get("deg") is not None:
+                        try:
+                            j = int(b["joint"])
+                            limited = abs(t[j] - float(b["deg"])) > 1e-6
+                        except Exception:
+                            limited = False
+                self._json({"ok": t is not None, "targets_deg": t,
+                            "lag_limited": limited})
             elif path == "/api/arm/reset":
                 b = self._body()
                 a = c.pick_arm(b)
                 ok = a.reset()
-                self._json({"ok": ok, "enabled": a.state()["enabled"],
-                            "joints_deg": a.state()["joints_deg"],
-                            "targets_deg": a.state()["targets_deg"]})
+                st = a.state()
+                self._json({"ok": ok, "enabled": st["enabled"],
+                            "motors_enabled": st.get("motors_enabled"),
+                            "mode_verified": st.get("mode_verified"),
+                            "joints_deg": st["joints_deg"],
+                            "targets_deg": st["targets_deg"]})
             elif path == "/api/arm/home":
                 b = self._body()
                 a = c.pick_arm(b)
                 t = a.go_home()
-                self._json({"ok": t is not None, "moving_to": t})
+                limited = bool(t is not None and any(
+                    abs(t[i] - a.home_deg[i]) > 1e-6 for i in range(6)))
+                self._json({"ok": t is not None, "moving_to": t,
+                            "lag_limited": limited})
             elif path == "/api/arm/enable":
                 b = self._body()
                 a = c.pick_arm(b)
-                a.set_enabled(bool(b.get("enable", True)))
-                self._json({"ok": True, "enabled": a.state()["enabled"]})
+                ok = a.set_enabled(bool(b.get("enable", True)))
+                st = a.state()
+                self._json({"ok": bool(ok),
+                            "enabled": st["enabled"],
+                            "motors_enabled": st.get("motors_enabled"),
+                            "enabled_all": st.get("enabled_all"),
+                            "mode_actual": st.get("mode_actual"),
+                            "mode_verified": st.get("mode_verified"),
+                            "error": None if ok else "requested state not verified"})
             elif path == "/api/gripper":
                 b = self._body()
+                delta = finite_float(b.get("delta_deg", 0.0))
+                if delta is None:
+                    self._bad("delta_deg must be finite")
+                    return
                 a = c.pick_arm(b)
-                t = a.nudge_gripper(b.get("delta_deg", 0.0))
+                t = a.nudge_gripper(delta)
                 self._json({"ok": t is not None, "gripper_target_deg": t})
             elif path == "/api/arm/mode":
                 b = self._body()
                 a = c.pick_arm(b)
                 ok = a.set_mode(b.get("mode"))
+                st = a.state()
                 self._json({"ok": ok, "mode": a.mode,
-                            "modes": list(a.MODES)})
+                            "modes": list(a.MODES),
+                            "mode_actual": st.get("mode_actual"),
+                            "mode_verified": st.get("mode_verified"),
+                            "error": None if ok else "mode switch not verified"})
             elif path == "/api/arm/mit":
                 b = self._body()
+                err = validate_mit_gains(b.get("kp"), b.get("kd"),
+                                         b.get("t_ref"))
+                if err:
+                    self._bad(err)
+                    return
                 a = c.pick_arm(b)
                 g = a.set_mit(kp=b.get("kp"), kd=b.get("kd"),
                               t_ref=b.get("t_ref"))
-                self._json({"ok": True, "mit": g, "mode": a.mode})
+                if not g.get("ok"):
+                    self._json({"ok": False, "error": g.get("error"),
+                                "mit": g, "mode": a.mode}, 400)
+                    return
+                self._json({"ok": bool(a.ok), "mit": g, "mode": a.mode,
+                            "error": None if a.ok else "arm not connected"})
             elif path == "/api/arm/movec":
                 b = self._body()
+                pts = b.get("points")
+                if not isinstance(pts, list) or len(pts) != 3:
+                    self._bad("MOVE C needs exactly 3 points")
+                    return
+                if any(finite_list(p) is None for p in pts):
+                    self._bad("MOVE C points must contain finite numbers")
+                    return
                 a = c.pick_arm(b)
-                self._json(a.run_movec(b.get("points")))
+                self._json(a.run_movec(pts))
             elif path == "/api/traj/load":
                 b = self._body()
+                pts = b.get("points")
+                if not isinstance(pts, list) or len(pts) < 2:
+                    self._bad("points must contain at least 2 frames")
+                    return
+                if any(finite_list(p) is None for p in pts):
+                    self._bad("points must contain finite angles")
+                    return
+                dt = finite_float(b.get("dt", 0.05))
+                if dt is None:
+                    self._bad("dt must be finite")
+                    return
                 a = c.pick_arm(b)
-                self._json(a.load_trajectory(b.get("name"), b.get("points"),
-                                             b.get("dt", 0.05)))
+                r = a.load_trajectory(b.get("name"), pts, dt)
+                if not r.get("ok"):
+                    self._json(r, 400)
+                    return
+                self._json(r)
             elif path == "/api/traj/load-file":
                 b = self._body()
+                dt = b.get("dt")
+                if dt is not None and finite_float(dt) is None:
+                    self._bad("dt must be finite")
+                    return
                 a = c.pick_arm(b)
-                self._json(a.load_trajectory_file(b.get("path"), b.get("dt")))
+                r = a.load_trajectory_file(b.get("path"), dt)
+                if not r.get("ok"):
+                    self._json(r, 400)
+                    return
+                self._json(r)
             elif path == "/api/traj/list":
                 self._json({"ok": True, "items": list_trajectories()})
             elif path == "/api/traj/play":
                 b = self._body()
+                speed = finite_float(b.get("speed", 1.0))
+                if speed is None:
+                    self._bad("speed must be finite")
+                    return
                 a = c.pick_arm(b)
                 self._json(a.play_trajectory(loop=b.get("loop", False),
-                                             speed=b.get("speed", 1.0)))
+                                             speed=speed))
             elif path == "/api/traj/pause":
                 b = self._body()
                 self._json(c.pick_arm(b).pause_trajectory())
@@ -2270,9 +3446,18 @@ class Handler(BaseHTTPRequestHandler):
                                           execute=bool(b.get("execute", False))))
             elif path == "/api/master-slave":
                 b = self._body()
+                try:
+                    leader = int(b.get("leader", 0))
+                    follower = int(b.get("follower", 1))
+                except (TypeError, ValueError):
+                    self._bad("leader/follower must be integers")
+                    return
+                if leader == follower:
+                    self._bad("leader and follower must differ")
+                    return
                 self._json(c.set_master_slave(bool(b.get("on", True)),
-                                              leader=b.get("leader", 0),
-                                              follower=b.get("follower", 1)))
+                                              leader=leader,
+                                              follower=follower))
             elif path == "/api/chassis/clear-fault":
                 ok = c.ros.clear_fault()
                 self._json({"ok": ok, "error_code": c.ros.error_code})
@@ -2291,11 +3476,36 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/estop":
                 c.set_estop(True)
                 log("E-STOP engaged")
-                self._json({"ok": True, "estop": True})
+                st = c.status()
+                arms = [{"side": x.get("side"),
+                         "enabled": x.get("enabled"),
+                         "motors_enabled": x.get("motors_enabled"),
+                         "feedback_ok": x.get("feedback_ok")}
+                        for x in st.get("arms", [])]
+                # E-STOP latching and motor torque-off are two different facts.
+                # Report both instead of a bare ok:true. If feedback is stale we
+                # cannot verify torque-off, so say so rather than assuming it.
+                fresh = [x for x in arms if x.get("feedback_ok")]
+                arms_disabled = bool(fresh) and all(
+                    (x.get("motors_enabled") or 0) == 0 for x in fresh)
+                warnings = ([] if arms_disabled
+                            else ["arm torque-off not confirmed"])
+                self._json({"ok": bool(st.get("estop")), "estop": True,
+                            "arms": arms, "arms_disabled": arms_disabled,
+                            "warnings": warnings})
             elif path == "/api/estop/clear":
+                b = self._body()
+                if str(b.get("confirm") or "") != "CLEAR":
+                    self._json({"ok": False,
+                                "error": "clearing E-STOP requires confirm=CLEAR"},
+                               409)
+                    return
                 c.set_estop(False)
                 log("E-STOP cleared")
-                self._json({"ok": True, "estop": False})
+                st = c.status()
+                self._json({"ok": not st.get("estop"), "estop": False,
+                            "arms_enabled": [x.get("enabled")
+                                             for x in st.get("arms", [])]})
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
         except Exception as e:
@@ -2304,10 +3514,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ACCESS_TOKEN
     log("starting agilex remote server")
-    ACCESS_TOKEN = load_or_make_session()
-    log(f"access control: {'DISABLED (AGILEX_ALLOW_ANON=1)' if ALLOW_ANON else 'cookie required off-loopback'}")
+    Handler.sessions = SessionStore()
+    if ALLOW_ANON:
+        log("access control: DISABLED (AGILEX_ALLOW_ANON=1)")
+    else:
+        log(f"access control: per-login session cookie, ttl {int(Handler.sessions.ttl)}s, "
+            f"max {Handler.sessions.max_sessions} sessions")
+    log(f"control lease: single controller, ttl {LEASE_TTL_S:g}s, "
+        f"takeover confirm={LEASE_TAKEOVER_CONFIRM!r}")
     ros = RosBridge()
     # Two Piper arms, six motors each. can_left is the left arm, can_right the
     # right. Order here defines the "arm" index used by the API (0 = left).
@@ -2324,7 +3539,8 @@ def main():
     # One frame hub per camera. Both the live MJPEG view and the episode
     # recorder read from these, because a V4L2 device cannot be opened twice -
     # verified: a second ffmpeg gets "Device or resource busy".
-    hubs = {cam: FrameHub(dev) for cam, dev in VIDEO_DEV.items()}
+    hubs = {cam: (HttpFrameHub(dev) if dev.startswith(("http://", "https://")) else FrameHub(dev))
+            for cam, dev in VIDEO_DEV.items()}
     Handler.hubs = hubs
     Handler.recorder = EpisodeRecorder(ctl, hubs)
     log(f"recorder ready: root={EPISODE_ROOT} at {RECORD_HZ:g} Hz")

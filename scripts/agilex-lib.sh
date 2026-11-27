@@ -1,12 +1,13 @@
-# Shared connection config for AgileX robot helpers.
-# Keep this file chmod 600 — it holds the sudo password.
+# Shared connection defaults for the AgileX helpers.
 #
-# AGILEX_HOST is the robot's mDNS name, NOT an IP: the robot is on eduroam
-# Wi-Fi with DHCP, so its address changes on every reboot (it has been
-# <robot-ip> and then <robot-ip>). avahi-daemon on the robot keeps
-# "agilex.local" pointed at the current address, and that name resolves fine
-# across the campus VPN. If mDNS ever fails, run bin/find-robot.sh.
-AGILEX_HOST=agilex.local
-AGILEX_USER=agilex
-AGILEX_PW=agx
+# This file contains NO credentials. The sudo password is never stored here:
+# scripts/rsudo.sh reads AGILEX_SUDO_PASSWORD from the environment or prompts.
+# The web UI password lives on the robot in /etc/agilex-remote.env (0600).
+#
+# AGILEX_HOST is the robot's mDNS name, NOT an IP: the robot is on DHCP, so its
+# address changes on every reboot. avahi-daemon on the robot keeps
+# "agilex.local" pointed at the current address. If mDNS fails, run
+# scripts/find-robot.sh or set AGILEX_HOST explicitly.
+AGILEX_HOST="${AGILEX_HOST:-agilex.local}"
+AGILEX_USER="${AGILEX_USER:-agilex}"
 AGILEX_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)

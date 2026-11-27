@@ -28,24 +28,36 @@ SAFETY, IN ORDER OF IMPORTANCE
     arm unloaded and a hand on the physical emergency stop, not on a live task.
 
 USAGE
-    # dry run: predict actions, print them, command nothing
+    # dry run: offline check only; no policy load, no robot, no lease
     python3 tools/run-smolvla.py --ckpt ~/runs/smolvla/checkpoints/last/pretrained_model \
                                  --task "pick and place" --dry-run --steps 20
 
-    # live, slow
+    # live, slow: acquires the control lease, heartbeats it, releases on exit
     python3 tools/run-smolvla.py --ckpt ... --task "pick and place" \
                                  --max-lin 0.05 --max-joint-step 0.5 --hz 5
+
+    # if another controller holds the lease, take it over explicitly
+    python3 tools/run-smolvla.py ... --takeover --confirm TAKEOVER
 """
 import argparse
 import json
 import os
+import socket
 import sys
+import threading
 import time
+import urllib.error
 import urllib.request
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # the lease tests import this module without numpy
+    np = None
 
-API = "http://127.0.0.1:8765"
+API = os.environ.get("AGILEX_API", "http://127.0.0.1:8765")
+CONTROLLER = os.environ.get(
+    "AGILEX_CONTROLLER", "run-smolvla-%s-%d" % (socket.gethostname(), os.getpid()))
+LEASE = None
 
 # The 14-dim layout the recorder writes and the policy predicts:
 #   [L_j0..L_j5, L_grip, R_j0..R_j5, R_grip]   degrees, gripper 0..70
@@ -53,12 +65,170 @@ STATE_COLS = [f"L_j{i}" for i in range(6)] + ["L_grip"] + \
              [f"R_j{i}" for i in range(6)] + ["R_grip"]
 
 
+class LeaseError(RuntimeError):
+    pass
+
+
+class LeaseLost(LeaseError):
+    pass
+
+
+class LeaseSession:
+    """Minimal client for the server's /api/lease/* control lease.
+
+    The secret lives only in this object (and the HTTP header); it is never
+    logged, printed, or written to disk. A daemon heartbeat extends the lease
+    during a long run. E-STOP and a zero-velocity /api/drive are sent without
+    the lease so a lost lease can never block a stop.
+    """
+
+    EXEMPT = {"/api/estop", "/api/lease/acquire", "/api/lease/heartbeat",
+              "/api/lease/release", "/api/record/status", "/api/traj/list"}
+
+    def __init__(self, api, controller, timeout=10):
+        self.api = api.rstrip("/")
+        self.controller = controller
+        self.timeout = timeout
+        self.secret = None
+        self.supported = True
+        self.lost = False
+        self._ttl = 20.0
+        self._stop = threading.Event()
+        self._heartbeat_thread = None
+
+    def _body(self, obj):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            obj = dict(obj)
+            obj.setdefault("controller", self.controller)
+        return json.dumps(obj).encode()
+
+    def _request(self, method, path, obj=None, lease=False, timeout=None):
+        if lease and self.lost:
+            raise LeaseLost("control lease lost")
+        data = self._body(obj)
+        headers = {}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if lease and self.secret:
+            headers["X-Control-Lease"] = self.secret
+        req = urllib.request.Request(self.api + path, data=data,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            body = {}
+            try:
+                body = json.loads(e.read().decode())
+            except Exception:
+                pass
+            if e.code == 409:
+                self.lost = True
+                raise LeaseLost("control lease required or expired") from None
+            raise LeaseError("HTTP %d: %s" % (e.code, body.get("error") or path)) from None
+
+    def acquire(self, takeover=False, confirm=None):
+        body = {"controller": self.controller, "takeover": bool(takeover)}
+        if confirm is not None:
+            body["confirm"] = confirm
+        try:
+            r = self._request("POST", "/api/lease/acquire", body, lease=False)
+        except LeaseError as e:
+            # Older servers have no lease endpoint; keep working unleased.
+            if "HTTP 404" in str(e) or "HTTP 405" in str(e):
+                self.supported = False
+                return False
+            raise
+        if not r.get("ok"):
+            raise LeaseError(str(r.get("error") or "lease refused"))
+        secret = r.get("lease")
+        if not secret:
+            raise LeaseError("lease response contained no secret")
+        self.secret = str(secret)
+        self._ttl = float(r.get("expires_in") or 20.0)
+        self.lost = False
+        if self._ttl > 0:
+            interval = max(2.0, min(5.0, self._ttl / 3.0))
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, args=(interval,), daemon=True)
+            self._heartbeat_thread.start()
+        return True
+
+    def _heartbeat_loop(self, interval):
+        while not self._stop.wait(interval):
+            try:
+                self.heartbeat()
+            except Exception:
+                self.lost = True
+                return
+
+    def heartbeat(self):
+        if not self.supported or not self.secret:
+            return None
+        try:
+            r = self._request("POST", "/api/lease/heartbeat", {}, lease=True)
+        except LeaseError:
+            self.lost = True
+            raise
+        if not r.get("ok"):
+            self.lost = True
+            raise LeaseLost("lease heartbeat failed")
+        return r
+
+    def post(self, path, obj, timeout=None):
+        if path == "/api/estop/clear":
+            if not isinstance(obj, dict) or obj.get("confirm") != "CLEAR":
+                raise LeaseError("clear requires body confirm=CLEAR")
+            lease = True
+        else:
+            lease = path not in self.EXEMPT
+        if path == "/api/drive" and isinstance(obj, dict):
+            try:
+                lease = not (abs(float(obj.get("lin") or 0.0)) <= 1e-9
+                             and abs(float(obj.get("ang") or 0.0)) <= 1e-9)
+            except Exception:
+                lease = True
+        return self._request("POST", path, obj, lease=lease, timeout=timeout)
+
+    def get(self, path, timeout=None):
+        return self._request("GET", path, None, lease=False, timeout=timeout)
+
+    def release(self):
+        self._stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+        if self.supported and self.secret:
+            try:
+                self._request("POST", "/api/lease/release", {}, lease=True)
+            except Exception:
+                pass
+            self.secret = None
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
 def api_get(path, timeout=10):
+    if LEASE is not None:
+        return LEASE.get(path, timeout=timeout)
     with urllib.request.urlopen(API + path, timeout=timeout) as r:
         return json.load(r)
 
 
 def api_post(path, obj, timeout=10):
+    if LEASE is not None:
+        return LEASE.post(path, obj, timeout=timeout)
+    if isinstance(obj, dict):
+        obj = dict(obj)
+        obj.setdefault("controller", CONTROLLER)
     req = urllib.request.Request(
         API + path, data=json.dumps(obj).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
@@ -111,6 +281,8 @@ def read_state(status):
 
 
 def main():
+    global API, CONTROLLER, LEASE
+    LEASE = None
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True,
                     help="path to .../checkpoints/<step>/pretrained_model")
@@ -118,7 +290,15 @@ def main():
                     help="language instruction fed to the VLM; should match the "
                          "task string the episodes were recorded with")
     ap.add_argument("--dry-run", action="store_true",
-                    help="predict but never command the robot")
+                    help="offline check only: no policy load, no robot contact, no lease")
+    ap.add_argument("--api", default=API,
+                    help="server base URL (default: AGILEX_API or 127.0.0.1:8765)")
+    ap.add_argument("--controller", default=CONTROLLER,
+                    help="controller id used for the control lease audit trail")
+    ap.add_argument("--takeover", action="store_true",
+                    help="request the lease even if another controller holds it")
+    ap.add_argument("--confirm", default=None,
+                    help="takeover confirmation; the server requires TAKEOVER")
     ap.add_argument("--steps", type=int, default=0, help="0 = run until Ctrl-C")
     ap.add_argument("--hz", type=float, default=4.0,
                     help="control loop rate; two /frame grabs measure 0.08-0.20 s, "
@@ -133,6 +313,15 @@ def main():
                     help="seconds to let cameras deliver a frame before starting")
     args = ap.parse_args()
 
+    API = args.api.rstrip("/")
+    CONTROLLER = args.controller
+    if args.dry_run:
+        print("DRY RUN: offline; no robot connection, no lease, no policy load")
+        return 0
+    if np is None:
+        print("numpy is required to run SmolVLA (pip install numpy)", file=sys.stderr)
+        return 1
+
     import torch
     import lerobot.policies.smolvla  # noqa: F401  (registers the policy class)
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -142,31 +331,45 @@ def main():
     print(f"policy loaded on {dev}")
 
     # -------------------------------------------------------------- preflight
-    print("preflight: waiting for cameras")
-    t0 = time.time()
-    while True:
-        try:
-            grab_frames()
-            break
-        except RuntimeError as e:
-            if time.time() - t0 > args.warmup + 30:
-                print(f"  FAILED: {e}", file=sys.stderr)
-                return 1
-            time.sleep(1.0)
-    print(f"  cameras ok after {time.time()-t0:.1f}s")
+    if args.dry_run:
+        st = None
+    else:
+        print("preflight: waiting for cameras")
+        t0 = time.time()
+        while True:
+            try:
+                grab_frames()
+                break
+            except RuntimeError as e:
+                if time.time() - t0 > args.warmup + 30:
+                    print(f"  FAILED: {e}", file=sys.stderr)
+                    return 1
+                time.sleep(1.0)
+        print(f"  cameras ok after {time.time()-t0:.1f}s")
 
-    st = api_get("/api/status")
-    for arm in st["arms"]:
-        faults = [i for i, f in enumerate(arm["faults"]) if f]
-        if faults:
-            print(f"  ARM {arm['side']} HAS FAULTS on joints {faults}: "
-                  f"{[arm['faults'][i] for i in faults]}", file=sys.stderr)
-            print("  refusing to run with a faulted arm", file=sys.stderr)
+        st = api_get("/api/status")
+        for arm in st["arms"]:
+            faults = [i for i, f in enumerate(arm["faults"]) if f]
+            if faults:
+                print(f"  ARM {arm['side']} HAS FAULTS on joints {faults}: "
+                      f"{[arm['faults'][i] for i in faults]}", file=sys.stderr)
+                print("  refusing to run with a faulted arm", file=sys.stderr)
+                return 1
+            if not arm["enabled"]:
+                print(f"  arm {arm['side']} not enabled", file=sys.stderr)
+                return 1
+        print("  arms enabled, no faults")
+
+        LEASE = LeaseSession(API, CONTROLLER)
+        try:
+            acquired = LEASE.acquire(takeover=args.takeover, confirm=args.confirm)
+        except LeaseError as e:
+            print(f"  lease: {e}", file=sys.stderr)
             return 1
-        if not arm["enabled"]:
-            print(f"  arm {arm['side']} not enabled", file=sys.stderr)
-            return 1
-    print("  arms enabled, no faults")
+        if acquired:
+            print("  control lease acquired")
+        else:
+            print("  lease: server has no lease API; continuing unleased")
 
     print(f"\n{'DRY RUN - no commands will be sent' if args.dry_run else 'LIVE'} | "
           f"max_lin={args.max_lin} m/s  max_joint_step={args.max_joint_step} deg  "
@@ -178,23 +381,32 @@ def main():
         while True:
             t_loop = time.time()
 
-            # Re-read health every single iteration. A policy that keeps pushing
-            # after the hardware has stopped listening is how arms get hurt.
-            st = api_get("/api/status")
-            for arm in st["arms"]:
-                if not arm["enabled"]:
-                    raise RuntimeError(f"arm {arm['side']} became disabled")
-                if any(arm["faults"]):
-                    raise RuntimeError(f"arm {arm['side']} faulted mid-run")
-                lag = max(abs(t - m) for t, m in
-                          zip(arm["targets_deg"], arm["joints_deg"]))
-                if lag > args.max_lag:
-                    raise RuntimeError(
-                        f"arm {arm['side']} lag {lag:.1f} deg > {args.max_lag}; "
-                        f"the arm is not following, aborting")
+            if args.dry_run:
+                # Synthetic observation: no HTTP, no camera, no lease.
+                state = np.zeros(14, dtype=np.float32)
+                frames = {
+                    "cam_left": np.zeros((256, 256, 3), dtype=np.uint8),
+                    "cam_right": np.zeros((256, 256, 3), dtype=np.uint8),
+                }
+            else:
+                # Re-read health every single iteration. A policy that keeps
+                # pushing after the hardware stopped listening is how arms get
+                # hurt.
+                st = api_get("/api/status")
+                for arm in st["arms"]:
+                    if not arm["enabled"]:
+                        raise RuntimeError(f"arm {arm['side']} became disabled")
+                    if any(arm["faults"]):
+                        raise RuntimeError(f"arm {arm['side']} faulted mid-run")
+                    lag = max(abs(t - m) for t, m in
+                              zip(arm["targets_deg"], arm["joints_deg"]))
+                    if lag > args.max_lag:
+                        raise RuntimeError(
+                            f"arm {arm['side']} lag {lag:.1f} deg > {args.max_lag}; "
+                            f"the arm is not following, aborting")
 
-            frames = grab_frames()
-            state = read_state(st)
+                frames = grab_frames()
+                state = read_state(st)
 
             batch = {
                 "observation.images.cam_left":
@@ -254,11 +466,19 @@ def main():
         return 1
     finally:
         if not args.dry_run:
+            # E-STOP first and without a lease requirement: a lost/expired
+            # lease must never prevent a stop.
             try:
                 api_post("/api/estop", {}, timeout=5)
                 print("emergency stop engaged on exit")
             except Exception:
                 print("WARNING: could not engage e-stop", file=sys.stderr)
+            if LEASE is not None:
+                try:
+                    LEASE.release()
+                    print("control lease released")
+                except Exception:
+                    print("WARNING: could not release the control lease", file=sys.stderr)
     return 0
 
 

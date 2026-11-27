@@ -272,7 +272,7 @@ Display Username Remote IP       Session ID                       Node
 
 $ /usr/NX/bin/nxserver --history          (last lines)
 Display Username Remote IP Session ID                       Date                Status    Node Type
-1002    agilex   10.92.0.118 E76AE93B...                    2026-09-14 09:56:13 Failed    physical-shadow
+1002    agilex   <ip> E76AE93B...                    2026-09-14 09:56:13 Failed    physical-shadow
 1       agilex   N/A         9C002A5E...                    2026-09-14 10:23:11 Finished  physical-desktop
 0       gdm      N/A         F6D359C5...                    2026-09-21 14:41:58 Finished  physical-desktop
 1       agilex   N/A         D6193426...                    2026-10-10 20:04:52 Available physical-desktop
@@ -284,7 +284,7 @@ $ ss -ulnp | grep 4000
 UNCONN 0 0 0.0.0.0:4000 0.0.0.0:*
 ```
 
-This is a strong signal: **an `Available` `physical-desktop` session on display `1` for user `agilex` already exists**, and the history shows this has *worked repeatedly* on this exact robot, including from a remote client (`10.92.0.118`) in September. Relevant config:
+This is a strong signal: **an `Available` `physical-desktop` session on display `1` for user `agilex` already exists**, and the history shows this has *worked repeatedly* on this exact robot, including from a remote client (`<ip>`) in September. Relevant config:
 
 ```
 /usr/NX/etc/server.cfg
@@ -517,7 +517,7 @@ Why this and not the direct port: the tunnel's userspace proxy makes every TCP p
 
 **Recipe A′ — direct (try first if you want one less step):**
 
-Point the client straight at `<robot-ip>:4000`. There is precedent — `nxserver --history` shows a remote client (`10.92.0.118`) completing a `physical-desktop` session on 2026-09-14, and `:4000` had a real ~2.5 s connect time versus ~0.1 s for ports that do not exist. If it hangs on "Connecting", switch to Recipe A.
+Point the client straight at `<robot-ip>:4000`. There is precedent — `nxserver --history` shows a remote client (`<ip>`) completing a `physical-desktop` session on 2026-09-14, and `:4000` had a real ~2.5 s connect time versus ~0.1 s for ports that do not exist. If it hangs on "Connecting", switch to Recipe A.
 
 ### Step 3 — Connect
 

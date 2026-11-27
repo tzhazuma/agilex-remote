@@ -30,7 +30,7 @@
                               THIS MOVES THE ARM - gated behind an inline confirm.
     POST /api/estop           (no body) -> disables BOTH arms
     POST /api/estop/clear     (no body)
-    GET  /video?cam=0 (LEFT ARM CAMERA) and /video?cam=2 (RIGHT ARM CAMERA) as <img> MJPEG
+    GET  /video?cam=0 (RIGHT), /video?cam=2 (LEFT), /video?cam=4 (GLOBAL BRIO), /video?cam=12 (REALSENSE D455) as <img> MJPEG
 
   TWO ARMS: `arm` is 0 = LEFT (can_left, the default) and 1 = RIGHT (can_right).
   Omitting the field is still valid and means the left arm, exactly as before, so
@@ -373,21 +373,24 @@
   <div class="topbar">
     <div class="brand">AgileX Remote<small>VIRTUAL CONTROLLER</small></div>
     <span id="connPill" class="pill warn" role="status" aria-live="polite">CONNECTING</span>
+    <span id="leasePill" class="pill" role="status" aria-live="polite" title="control lease">CONTROL: --</span>
     <span class="grow"></span>
+    <button id="leaseTakeBtn" class="mini" hidden title="Take control from the current controller (audited)">Take control</button>
+    <button id="leaseReleaseBtn" class="mini" hidden title="Release the control lease">Release</button>
     <button id="estopClearBtn" class="estop-clear" hidden>CLEAR E-STOP</button>
     <button id="estopBtn" class="estop" aria-label="Emergency stop: zero velocity and disable both arms">E-STOP</button>
   </div>
   <div class="banner">
     <b>ROBOT IS LIVE.</b>
     <span id="bannerText">Movements capped at 0.08 m/s and 2&deg; per joint step.</span>
-    <span class="banner-note"><b>Reset</b> re-enables without moving &middot; <b>Home &#9888;</b> MOVES the arm and asks first.</span>
+    <span class="banner-note"><b>E-STOP removes arm torque</b> (a raised arm may fall) &middot; <b>Reset</b> re-enables without moving &middot; <b>Home &#9888;</b> MOVES the arm and asks first.</span>
   </div>
   <div id="lostBar" class="lostbar" role="alert">
     <span>CONNECTION LOST &mdash; velocity commands stopped.</span>
     <button id="retryBtn" class="mini">Retry now</button>
   </div>
   <div id="estopBar" class="estopbar" role="alert">
-    <span>E-STOP ACTIVE &mdash; drive and BOTH arms are disabled until cleared.</span>
+    <span>E-STOP ACTIVE &mdash; drive stopped and BOTH arms have motor torque removed. A raised arm may fall; the hardware E-stop is the only power cutoff.</span>
   </div>
 </div>
 
@@ -422,8 +425,8 @@
 
       <div class="sep"></div>
 
-      <label class="hint" for="speed">Speed limit <b id="speedVal" class="mono">50%</b></label>
-      <input id="speed" class="slider" type="range" min="10" max="100" step="5" value="50"
+      <label class="hint" for="speed">Speed limit <b id="speedVal" class="mono">20%</b></label>
+      <input id="speed" class="slider" type="range" min="10" max="100" step="5" value="20"
              aria-label="Speed limit as a percentage of the robot's maximum">
       <div class="kv"><span>max linear</span><span id="maxLinVal">0.040 m/s</span></div>
       <div class="kv"><span>max angular</span><span id="maxAngVal">0.075 rad/s</span></div>
@@ -444,30 +447,56 @@
 
     <div class="cam primary">
       <div class="cam-head">
-        <span class="cam-title">LEFT ARM CAMERA</span>
+        <span class="cam-title">RIGHT ARM CAMERA</span>
         <span class="cam-sub">/video?cam=0</span>
         <span class="grow"></span>
         <button class="mini" data-reconnect="0">Reconnect</button>
       </div>
       <div class="cam-body">
-        <img id="camImg0" alt="Live view from the left arm camera" decoding="async">
+        <img id="camImg0" alt="Live view from the right arm camera" decoding="async">
         <div class="nosignal" id="camNs0">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
       </div>
     </div>
 
     <div class="cam primary">
       <div class="cam-head">
-        <span class="cam-title">RIGHT ARM CAMERA</span>
+        <span class="cam-title">LEFT ARM CAMERA</span>
         <span class="cam-sub">/video?cam=2</span>
         <span class="grow"></span>
         <button class="mini" data-reconnect="2">Reconnect</button>
       </div>
       <div class="cam-body">
-        <img id="camImg2" alt="Live view from the right arm camera" decoding="async">
+        <img id="camImg2" alt="Live view from the left arm camera" decoding="async">
         <div class="nosignal" id="camNs2">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
       </div>
     </div>
-    <div class="hint">Both cameras are mounted on the arms. Android Chrome sometimes drops long-lived MJPEG streams &mdash; use Reconnect.</div>
+
+    <div class="cam primary">
+      <div class="cam-head">
+        <span class="cam-title">GLOBAL / LOGITECH BRIO</span>
+        <span class="cam-sub">/video?cam=4</span>
+        <span class="grow"></span>
+        <button class="mini" data-reconnect="4">Reconnect</button>
+      </div>
+      <div class="cam-body">
+        <img id="camImg4" alt="Live global view from the Logitech BRIO camera" decoding="async">
+        <div class="nosignal" id="camNs4">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
+      </div>
+    </div>
+
+    <div class="cam primary">
+      <div class="cam-head">
+        <span class="cam-title">REALSENSE D455</span>
+        <span class="cam-sub">/video?cam=12</span>
+        <span class="grow"></span>
+        <button class="mini" data-reconnect="12">Reconnect</button>
+      </div>
+      <div class="cam-body">
+        <img id="camImg12" alt="Live global view from the RealSense D455 camera" decoding="async">
+        <div class="nosignal" id="camNs12">NO SIGNAL<br><span style="font-weight:400">tap Reconnect</span></div>
+      </div>
+    </div>
+    <div class="hint">Wrist cameras are mounted on the arms; BRIO and RealSense D455 provide global views. Android Chrome sometimes drops long-lived MJPEG streams &mdash; use Reconnect.</div>
   </section>
 
   <!-- ============ ARMS (both) ============ -->
@@ -598,22 +627,43 @@
      requested before the panels are built. */
   var armJogStops = [];
 
+  function makeControllerId() {
+    try {
+      if (window.crypto && crypto.randomUUID) return 'ctl-' + crypto.randomUUID();
+    } catch (e) {}
+    return 'ctl-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+  function loadControllerId() {
+    try {
+      var v = sessionStorage.getItem('agilex_controller_id');
+      if (!v) { v = makeControllerId(); sessionStorage.setItem('agilex_controller_id', v); }
+      return v;
+    } catch (e) { return makeControllerId(); }
+  }
+
   var state = {
     connected: false,
     everConnected: false,
     statusFails: 0,
+    controllerId: loadControllerId(),
+    leaseSecret: null,        /* memory only; never localStorage */
+    leaseExpires: 0,
+    lease: {},
+    leaseLostNotice: false,
     estopLatch: false,        /* set by the E-STOP button; cleared only by a
                                  successful /api/estop/clear. The UI stays in the
                                  stopped state if the E-STOP POST failed - it
                                  never silently pretends the robot is safe. */
     serverEstop: false,
     gesture: false,           /* any real user gesture has happened */
-    speedPct: 50,
+    speedPct: 20,
+    speedInited: false,
     stepDeg: 1.0,
     arms: [blankArm(), blankArm()],
     homeConfirmArm: null,     /* which arm's inline Home confirmation is open */
     homeConfirmTimer: null,
-    limits: { max_lin: 0.08, max_ang: 0.15, max_joint_step_deg: 2.0 },
+    limits: { max_lin: 2.3, max_ang: 0.7853, max_joint_step_deg: 2.0,
+              max_target_lag_deg: 15.0, movec_enabled: false },
     watchdogMs: 700,
     gamepadName: '',
     gamepadIndex: null,
@@ -677,23 +727,154 @@
   /* =====================================================================
      3. API layer - every call is wrapped, times out, and can never throw
      ===================================================================== */
-  function api(method, url, body, timeoutMs) {
+  function needsLease(url, body) {
+    var p = (url || '').split('?')[0];
+    if (p.indexOf('/api/') !== 0) return false;
+    if (p === '/api/login' || p === '/api/logout') return false;
+    if (p.indexOf('/api/lease/') === 0) return false;
+    if (p === '/api/estop') return false;
+    if (p === '/api/record/status' || p === '/api/traj/list') return false;
+    if (p === '/api/drive') {
+      var lin = body ? Number(body.lin) : 0;
+      var ang = body ? Number(body.ang) : 0;
+      if (!isFinite(lin)) lin = 0;
+      if (!isFinite(ang)) ang = 0;
+      if (Math.abs(lin) < 1e-9 && Math.abs(ang) < 1e-9) return false;
+    }
+    return true;
+  }
+
+  function rawApi(method, url, body, timeoutMs) {
     var ctl = null, timer = null;
     try { ctl = new AbortController(); } catch (e) { ctl = null; }
     var opts = { method: method, cache: 'no-store' };
-    if (body !== null && body !== undefined) {
+    var send = body;
+    if (send && typeof send === 'object' && !Array.isArray(send)
+        && url.indexOf('/api/login') !== 0 && url.indexOf('/api/logout') !== 0
+        && send.controller === undefined) {
+      send = Object.assign({}, send, { controller: state.controllerId });
+    }
+    if (send !== null && send !== undefined) {
       opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = JSON.stringify(body);
+      opts.body = JSON.stringify(send);
+    }
+    if (method !== 'GET' && state.leaseSecret && url.indexOf('/api/lease/acquire') !== 0) {
+      opts.headers = opts.headers || {};
+      opts.headers['X-Control-Lease'] = state.leaseSecret;
     }
     if (ctl) { opts.signal = ctl.signal; timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, timeoutMs || 2000); }
     return fetch(url, opts).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      if (!res.ok) {
+        state.lastHttpStatus = res.status;
+        return res.json().catch(function () { return {}; }).then(function (j) {
+          state.lastHttpError = j || {};
+          if (res.status === 409) {
+            state.leaseSecret = null;
+            state.leaseExpires = 0;
+            if (j && j.lease) state.lease = j.lease;
+            renderLease();
+          }
+          return null;
+        });
+      }
+      state.lastHttpStatus = 0;
+      state.lastHttpError = null;
       return res.json();
     }).catch(function () {
-      return null;               /* never rejects: callers always get null on failure */
+      return null;
     }).then(function (v) {
       if (timer) clearTimeout(timer);
       return v;
+    });
+  }
+
+  function renderLease() {
+    var p = el('leasePill');
+    if (!p) return;
+    var l = state.lease || {};
+    var mine = !!state.leaseSecret && l.held === true && l.controller === state.controllerId;
+    var other = l.held === true && !mine;
+    var secs = Math.max(0, Math.round((state.leaseExpires - Date.now()) / 1000));
+    setText(p, mine ? ('CONTROL: YOU \u00b7 ' + secs + 's')
+                    : (other ? ('CONTROL: ' + (l.controller || 'other')) : 'CONTROL: free'));
+    setClass(p, 'pill ' + (mine ? 'ok' : (other ? 'warn' : '')));
+    p.title = l.held ? ('controller ' + l.controller + ', expires in ' + (l.expires_in || '?') + 's')
+                     : 'no controller holds the lease';
+    var tb = el('leaseTakeBtn'), rb = el('leaseReleaseBtn');
+    if (tb) tb.hidden = !other;
+    if (rb) rb.hidden = !mine;
+  }
+
+  function clearLease(notify) {
+    state.leaseSecret = null;
+    state.leaseExpires = 0;
+    if (notify) toast('Control lease lost \u2014 take control again', true);
+    renderLease();
+  }
+
+  function ensureLease() {
+    if (state.leaseSecret && state.leaseExpires > Date.now() + 2000) return Promise.resolve(true);
+    if (state.leaseSecret) clearLease(false);
+    return rawApi('POST', '/api/lease/acquire', { controller: state.controllerId }, 3000).then(function (r) {
+      if (r && r.ok && r.lease) {
+        state.leaseSecret = r.lease;
+        state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+        state.lease = { held: true, controller: r.controller || state.controllerId,
+                        expires_in: r.expires_in || 20 };
+        state.leaseLostNotice = false;
+        renderLease();
+        return true;
+      }
+      var e = state.lastHttpError || {};
+      var why = (e.error || 'control lease held');
+      if (!state.leaseLostNotice) {
+        toast('Control lease: ' + why + ' \u2014 use Take control', true);
+        state.leaseLostNotice = true;
+      }
+      if (e.lease) state.lease = e.lease;
+      renderLease();
+      pollStatus();
+      return false;
+    });
+  }
+
+  function api(method, url, body, timeoutMs) {
+    if (method === 'POST' && needsLease(url, body)) {
+      return ensureLease().then(function (ok) {
+        if (!ok) return { ok: false, lease: true, error: 'control lease required' };
+        return rawApi(method, url, body, timeoutMs);
+      });
+    }
+    return rawApi(method, url, body, timeoutMs);
+  }
+
+  function takeControl() {
+    var l = state.lease || {};
+    if (!window.confirm('Take control from ' + (l.controller || 'the other controller')
+        + '?\n\nThat client will lose authority to move the robot.')) return;
+    state.leaseLostNotice = false;
+    rawApi('POST', '/api/lease/acquire',
+           { controller: state.controllerId, takeover: true, confirm: 'TAKEOVER' }, 4000)
+      .then(function (r) {
+        if (r && r.ok && r.lease) {
+          state.leaseSecret = r.lease;
+          state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+          state.lease = { held: true, controller: r.controller || state.controllerId,
+                          expires_in: r.expires_in || 20 };
+          toast('Control acquired');
+        } else {
+          toast('Take control failed' + (r && r.error ? ': ' + r.error : ''), true);
+        }
+        pollStatus(); renderLease();
+      });
+  }
+
+  function releaseLease() {
+    if (!state.leaseSecret) { clearLease(false); return; }
+    rawApi('POST', '/api/lease/release', { controller: state.controllerId }, 3000).then(function (r) {
+      if (r && r.ok) { clearLease(false); toast('Control released'); }
+      else { clearLease(false); toast('Release failed \u2014 lease no longer yours', true); }
+      pollStatus();
     });
   }
 
@@ -706,9 +887,9 @@
     api('POST', '/api/drive', { lin: lin, ang: ang }, 900).then(function (r) {
       driveInFlight = false;
       state.sending = false;
-      if (r) {
+      if (r && r.ok === true) {
         driveFails = 0;
-      } else if (countFailure) {
+      } else if (countFailure && !(r && r.lease)) {
         driveFails++;
         if (driveFails >= 4) setConnected(false);   /* link is unusable: stop commanding */
       }
@@ -783,9 +964,31 @@
       if (typeof s.limits.max_joint_step_deg === 'number' && s.limits.max_joint_step_deg > 0) {
         state.limits.max_joint_step_deg = s.limits.max_joint_step_deg;
       }
+      if (typeof s.limits.max_target_lag_deg === 'number' && s.limits.max_target_lag_deg > 0) {
+        state.limits.max_target_lag_deg = s.limits.max_target_lag_deg;
+      }
+      if (typeof s.limits.movec_enabled === 'boolean') {
+        state.limits.movec_enabled = s.limits.movec_enabled;
+      }
+      /* The server's DEFAULT_LIN is the intended first-contact speed; the old
+         page ignored it and started at 50% of MAX_LIN (1.15 m/s). Derive the
+         slider from it once, in the slider's own 5% steps. */
+      if (!state.speedInited && typeof s.limits.default_lin === 'number'
+          && s.limits.default_lin > 0 && state.limits.max_lin > 0) {
+        var pct = Math.round((s.limits.default_lin / state.limits.max_lin) * 100 / 5) * 5;
+        state.speedPct = clamp(pct, 10, 100);
+        state.speedInited = true;
+        var sp = el('speed');
+        if (sp) sp.value = String(state.speedPct);
+      }
     }
     if (typeof s.watchdog_ms === 'number' && s.watchdog_ms > 0) state.watchdogMs = s.watchdog_ms;
     state.serverEstop = !!s.estop;
+    state.lease = s.lease || {};
+    var lease = state.lease;
+    if (state.leaseSecret && (!lease.held || lease.controller !== state.controllerId)) {
+      clearLease(true);
+    }
 
     var ch = s.chassis || {};
     setText(el('rBatt'), (typeof ch.battery_v === 'number' ? ch.battery_v.toFixed(1) : '--') + ' V');
@@ -820,6 +1023,7 @@
       + state.limits.max_joint_step_deg + '\u00b0 per joint step.');
     renderEstop();
     renderConnection();
+    renderLease();
     renderDriveState();
     renderStepCap();
   }
@@ -827,6 +1031,10 @@
     var a = state.arms[i], k = armKey(i);
     a.connected = !!ar.connected;
     a.enabled = !!ar.enabled;
+    a.enabledAll = !!ar.enabled_all;
+    a.motorsEnabled = (typeof ar.motors_enabled === 'number') ? ar.motors_enabled : null;
+    a.feedbackOk = ar.feedback_ok !== false;
+    a.feedbackFault = !!ar.feedback_fault;
     a.firmware = ar.firmware || '';
     a.errorCode = (typeof ar.error_code === 'number') ? ar.error_code : null;
     if (Array.isArray(ar.joints_deg)) a.joints = ar.joints_deg.slice(0, 6);
@@ -842,7 +1050,9 @@
     setText(el('rFw' + k), a.firmware || '--');
     var jt = a.jitter;
     setText(el('rJit' + k), (jt && typeof jt.cmd_hz === 'number' && typeof jt.feedback_hz === 'number')
-      ? 'cmd ' + jt.cmd_hz.toFixed(0) + ' / fb ' + jt.feedback_hz.toFixed(0) + ' Hz' : '--');
+      ? 'cmd ' + jt.cmd_hz.toFixed(0) + ' / fb ' + jt.feedback_hz.toFixed(0) + ' Hz'
+        + (a.feedbackOk ? '' : ' STALE')
+      : '--');
 
     var n = a.jointsEnabled ? a.jointsEnabled.filter(Boolean).length : null;
     var nf = 0, q;
@@ -862,6 +1072,8 @@
     }
 
     a.mode = ar.mode || 'pos_j';
+    a.modeActual = ar.mode_actual || null;
+    a.modeVerified = !!ar.mode_verified;
     a.teaching = !!ar.teaching;
     a.traj = ar.traj || null;
     var ms = ar.master_slave || {};
@@ -873,9 +1085,22 @@
       setClass(msb, 'armbtn' + (ms.enabled ? ' btn-danger' : ''));
     }
     var sel = el('modeSel' + k);
-    if (sel && document.activeElement !== sel) sel.value = a.mode;
+    if (sel) {
+      if (document.activeElement !== sel) sel.value = a.mode;
+      var mo = sel.querySelector('option[value="movec"]');
+      if (mo) {
+        mo.disabled = !state.limits.movec_enabled;
+        mo.textContent = state.limits.movec_enabled
+          ? 'MOVE C \u2014 Cartesian arc'
+          : 'MOVE C \u2014 disabled (experimental)';
+      }
+    }
     var mt = el('modeTag' + k);
-    if (mt) setText(mt, MODE_LABEL[a.mode] || a.mode);
+    if (mt) {
+      setText(mt, (MODE_LABEL[a.mode] || a.mode) + (a.modeVerified ? '' : ' ?'));
+      mt.title = 'arm reports ' + (a.modeActual || 'unknown')
+        + (a.modeVerified ? ' (verified)' : ' (NOT verified)');
+    }
     var tb = el('teachBtn' + k);
     if (tb) {
       setText(tb, a.teaching ? 'Teach \u25A0' : 'Teach \u25CF');
@@ -1190,10 +1415,16 @@
     renderEstop();
     renderConnection();
     renderDriveState();
-    api('POST', '/api/estop', null, 2500).then(function (r) {
+    api('POST', '/api/estop', {}, 2500).then(function (r) {
       if (r && r.estop === true) {
         state.serverEstop = true;
-        toast('E-STOP engaged' + (origin ? ' (' + origin + ')' : ''));
+        var msg = 'E-STOP engaged (torque off' + (origin ? ' via ' + origin : '') + ')';
+        if (r.arms_disabled === false) {
+          msg += ' \u2014 arm torque-off NOT confirmed, use the hardware E-stop';
+          toast(msg, true);
+        } else {
+          toast(msg + ' \u2014 support the arm');
+        }
       } else {
         state.serverEstop = true;   /* stay latched regardless - fail safe */
         toast('E-STOP sent, but the server did not confirm it', true);
@@ -1202,12 +1433,13 @@
     });
   }
   function clearEstop() {
-    api('POST', '/api/estop/clear', null, 2500).then(function (r) {
+    if (!window.confirm('Clear the software E-STOP? This needs the control lease; the arms stay disabled and must be enabled explicitly.')) return;
+    api('POST', '/api/estop/clear', { confirm: 'CLEAR' }, 2500).then(function (r) {
       if (r && r.estop === false) {
         state.estopLatch = false;
         state.serverEstop = false;
         renderEstop(); renderConnection(); renderDriveState();
-        toast('E-STOP cleared');
+        toast('E-STOP cleared \u2014 arms stay disabled; enable explicitly');
       } else {
         toast('Could not clear E-STOP (server did not confirm)', true);
       }
@@ -1283,7 +1515,7 @@
       +       '<option value="pos_j">MOVE J &mdash; joint position</option>'
       +       '<option value="pos_p">MOVE P &mdash; point to point</option>'
       +       '<option value="mit">MIT &mdash; impedance</option>'
-      +       '<option value="movec">MOVE C &mdash; Cartesian arc</option>'
+      +       '<option value="movec" disabled>MOVE C &mdash; disabled (experimental)</option>'
       +     '</select>'
       +     '<span class="tag" id="modeTag' + k + '">MOVE J</span>'
       +   '</div>'
@@ -1459,11 +1691,10 @@
   }
 
   /* ---- ABSOLUTE target angles -------------------------------------------------
-     Deliberately NOT clamped to `max_joint_step_deg`: that cap exists to keep a
-     single incremental nudge small, and applying it to an absolute target would
-     make it impossible to ever command a distant angle. The server clamps an
-     absolute target to the joint limits, which is the right authority. We only
-     reject values that are not numbers at all. */
+     The 2 deg `max_joint_step_deg` cap is for incremental nudges, so it is not
+     applied here. The server still clamps every absolute target to the joint
+     limit AND to MAX_TARGET_LAG_DEG around the measured angle; a distant target
+     therefore takes several requests. `lag_limited` says when that happened. */
   function sendTargets(i, body, okMsg) {
     if (!state.connected) { toast('No link to the robot', true); return; }
     body.arm = i;
@@ -1473,7 +1704,12 @@
         state.arms[i].targets = r.targets_deg.slice(0, 6);
         renderJoints(i); renderArmPanel(i); markVizDirty(i);
       }
-      toast(okMsg);
+      if (r.lag_limited) {
+        toast(armTitle(i) + ' target limited to ' + state.limits.max_target_lag_deg
+              + '\u00b0 from measured \u2014 send again to continue', true);
+      } else {
+        toast(okMsg);
+      }
     });
   }
   function sendOneTarget(i, joint) {
@@ -1503,11 +1739,22 @@
   var MODE_LABEL = { pos_j: 'MOVE J', pos_p: 'MOVE P', mit: 'MIT', movec: 'MOVE C' };
 
   function setArmMode(i, mode) {
+    if (mode === 'mit') {
+      toast('MIT makes the arm compliant \u2014 gravity will move it. Clear the area and keep the hardware E-stop in hand.', true);
+    } else if (mode === 'movec') {
+      toast('MOVE C is experimental and disabled unless AGILEX_ENABLE_MOVEC=1.', true);
+    }
     api('POST', '/api/arm/mode', { arm: i, mode: mode }, 5000).then(function (r) {
-      if (r && r.ok) toast(armTitle(i) + ' mode: ' + (MODE_LABEL[mode] || mode));
-      else toast('Mode switch failed on ' + armTitle(i));
+      if (r && r.ok) {
+        toast(armTitle(i) + ' mode: ' + (MODE_LABEL[mode] || mode));
+      } else {
+        toast('Mode switch failed on ' + armTitle(i)
+              + (r && r.error ? ': ' + r.error : ''), true);
+        var sel = el('modeSel' + armKey(i));
+        if (sel) sel.value = state.arms[i].mode || 'pos_j';
+      }
       pollStatus();
-    }).catch(function () { toast('Mode switch failed on ' + armTitle(i)); });
+    }).catch(function () { toast('Mode switch failed on ' + armTitle(i), true); });
   }
 
   function toggleTeach(i) {
@@ -1515,8 +1762,8 @@
     api('POST', '/api/teach', { arm: i, on: on }, 5000).then(function (r) {
       if (!r || !r.ok) { toast('Teach request failed'); return; }
       toast(on
-        ? 'Drag-teach RECORDING on ' + armTitle(i) + ' — guide it by hand, then Teach ▶ to replay'
-        : 'Drag-teach stopped on ' + armTitle(i));
+        ? 'Drag-teach ON ' + armTitle(i) + ' \u2014 position control released; support the arm and guide it by hand'
+        : 'Drag-teach stopped on ' + armTitle(i), on);
       pollStatus();
     }).catch(function () { toast('Teach request failed'); });
   }
@@ -1598,7 +1845,20 @@
       if (!r || typeof r.enabled !== 'boolean') { toast(armTitle(i) + ' enable/disable failed', true); return; }
       a.enabled = r.enabled;
       renderArmPanel(i);
+      if (r.ok !== true) {
+        toast(armTitle(i) + (want ? ' enable' : ' disable') + ' failed'
+              + (r.error ? ': ' + r.error : '')
+              + ' (' + (typeof r.motors_enabled === 'number' ? r.motors_enabled : '?') + '/6)', true);
+        pollStatus();
+        return;
+      }
       if (!want) { toast(armTitle(i) + ' disabled'); return; }
+      if (r.mode_verified === false) {
+        toast(armTitle(i) + ' enabled, but the arm reports '
+              + (r.mode_actual || 'unknown') + ' and the mode is NOT verified', true);
+        pollStatus();
+        return;
+      }
       // Enabling can succeed for only SOME motors - say so instead of a bland
       // "enabled", which is how a dead joint used to go unnoticed.
       pollStatus().then(function () {
@@ -1676,7 +1936,12 @@
     api('POST', '/api/arm/home', { arm: i }, 8000).then(function (r) {
       if (btn) btn.disabled = stopped() || !state.connected;
       if (!r || r.ok !== true) { toast(armTitle(i) + ' home failed', true); return; }
-      toast(armTitle(i) + ' moving home \u2192 ' + fmtPose(r.moving_to));
+      if (r.lag_limited) {
+        toast(armTitle(i) + ' home limited to ' + state.limits.max_target_lag_deg
+              + '\u00b0 per press \u2014 press Home again to continue', true);
+      } else {
+        toast(armTitle(i) + ' moving home \u2192 ' + fmtPose(r.moving_to));
+      }
       pollStatus();
     });
   }
@@ -2060,7 +2325,9 @@
      ===================================================================== */
   var CAMERAS = [
     { cam: 0, img: 'camImg0', ns: 'camNs0' },
-    { cam: 2, img: 'camImg2', ns: 'camNs2' }
+    { cam: 2, img: 'camImg2', ns: 'camNs2' },
+    { cam: 4, img: 'camImg4', ns: 'camNs4' },
+    { cam: 12, img: 'camImg12', ns: 'camNs12' }
   ];
   var camState = {};
   function camUrl(cam) { return '/video?cam=' + cam; }
@@ -2120,7 +2387,25 @@
   el('msBtn').addEventListener('click', toggleMasterSlave);
   el('estopBtn').addEventListener('click', function () { triggerEstop('button'); });
   el('estopClearBtn').addEventListener('click', clearEstop);
+  el('leaseTakeBtn').addEventListener('click', takeControl);
+  el('leaseReleaseBtn').addEventListener('click', releaseLease);
   el('retryBtn').addEventListener('click', function () { pollStatus(); toast('Retrying…'); });
+  renderLease();
+  /* Short lease: heartbeat while this page holds it. A hidden/throttled tab
+     simply lets it expire, which frees control for someone else. */
+  setInterval(function () {
+    if (!state.leaseSecret) return;
+    rawApi('POST', '/api/lease/heartbeat', {}, 2500).then(function (r) {
+      if (r && r.ok) {
+        state.leaseExpires = Date.now() + ((r.expires_in || 20) * 1000);
+        if (state.lease) state.lease.expires_in = r.expires_in || 20;
+        renderLease();
+      } else {
+        clearLease(true);
+        pollStatus();
+      }
+    });
+  }, 5000);
   var speedEl = el('speed');
   speedEl.addEventListener('input', function () {
     state.speedPct = clamp(parseInt(this.value, 10) || 50, 10, 100);

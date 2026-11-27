@@ -14,9 +14,9 @@ network.
 
 | | |
 |---|---|
-| **What the user does** | Run `./bin/robot-vnc.sh` (or open **VNC Viewer** and connect) |
+| **What the user does** | Run `./scripts/robot-vnc.sh` (or open **VNC Viewer** and connect) |
 | **Address** | `localhost:5900` |
-| **Password** | `agx` |
+| **Password** | the password you set on the robot (not recorded in this bundle) |
 | **What they see** | The robot's **real, already-logged-in desktop on display `:0`** — the same thing that is on the robot's own monitor |
 | **Robot side** | `x11vnc` 0.9.16 from apt, `systemd` unit `x11vnc.service` (enabled + active), bound to `127.0.0.1:5900` only |
 | **Mac side** | launchd agent `com.example.agilex-vnc-tunnel` (RunAtLoad + KeepAlive), SSH tunnel `localhost:5900 → robot 127.0.0.1:5900` |
@@ -27,10 +27,10 @@ network.
 
 ```bash
 cd ~/Documents/deepseek-harness/default-workspace/agilex-setup
-./bin/robot-vnc.sh          # ensures the tunnel, checks the chain, launches VNC Viewer
+./scripts/robot-vnc.sh          # ensures the tunnel, checks the chain, launches VNC Viewer
 ```
 
-Then in VNC Viewer: **Address `localhost:5900`**, **Password `agx`**.
+Then in VNC Viewer: **Address `localhost:5900`**, **Password** = the one you set on the robot.
 
 > RealVNC Viewer does **not** register the `vnc://` URL scheme (its `Info.plist` only
 > declares `com.realvnc.vncviewer.sso` and `com.realvnc.vncviewer.connect`), so
@@ -100,9 +100,8 @@ framebuffer polling — the wrong trade for a link the user already finds sluggi
 
 ### 2.3 Consequences that shaped the unit
 
-* `/etc/x11vnc.pass` is **`agilex:agilex`, mode 600** (not `root:root`) so the service
-  account can read it. It is the same password the user already knows, so this
-  reveals nothing new to that account.
+* `/etc/x11vnc.pass` is owned by the service account and mode 600, so the service
+  can read it. The password itself is not recorded in this repository.
 * `ExecStartPre` waits (bounded to 10 min) for `/tmp/.X11-unix/X0` **and** the cookie
   before starting, so a cold boot does not spin on a desktop that does not exist yet.
 * `Restart=always` + the `ExecStartPre` wait means a logout/login (which restarts Xorg
@@ -112,31 +111,28 @@ framebuffer polling — the wrong trade for a link the user already finds sluggi
 
 ## 3. What was installed / changed
 
-### Robot (`agilex@<robot-ip>`), all via `bin/rsudo.sh`
+### Robot (`agilex@<robot-ip>`), all via `scripts/rsudo.sh`
 
 | Path | What |
 |---|---|
 | — | `apt-get install -y x11vnc` → **0.9.16-8** (amd64) |
-| `/etc/x11vnc.pass` | VNC password file, `agilex:agilex` `0600`, 8 bytes: `5b9b15565fc5fcaf` |
+| `/etc/x11vnc.pass` | VNC password file (contents not recorded here), `0600` |
 | `/etc/systemd/system/x11vnc.service` | the service (md5 `236eb918d1375e66e0d06593e5f3fd29`), enabled + active |
 
 Nothing else on the robot was touched — no NoMachine config, no `.bashrc`/`.zshrc`/
 `.profile`, no `custom.conf`, no `agilex-report-ip.sh`, no ROS workspace.
 
-**Proof the password file really holds `agx`:** the VNC password file format is
-DES-ECB of the 8-byte password using the mirrored fixed key `17526b06234e5807`:
-
-```
-$ printf 'agx\0\0\0\0\0' | openssl enc -des-ecb -K e84ad660c4721ae0 -nopad | xxd -p
-5b9b15565fc5fcaf        ← byte-for-byte identical to /etc/x11vnc.pass
-```
+**Do not print the password or its stored hash.** Verify the file exists with the
+right owner/mode (`stat -c '%U %a' /etc/x11vnc.pass`) and prove authentication
+end-to-end with the `--probe` path below. The password is set on the robot by the
+operator; it is deliberately absent from this repository and its reports.
 
 ### Mac (`<you>@<mac>`)
 
 | Path | What |
 |---|---|
 | `~/Library/LaunchAgents/com.example.agilex-vnc-tunnel.plist` | standing tunnel `-L 5900:127.0.0.1:5900 agilex`, RunAtLoad + KeepAlive + ThrottleInterval 15 |
-| `bin/robot-vnc.sh` | helper: default / `--status` / `--probe` / `--restart` / `--stop` |
+| `scripts/robot-vnc.sh` | helper: default / `--status` / `--probe` / `--restart` / `--stop` |
 
 `~/.ssh/config` was **not** modified (the existing `agilex` alias + `~/.local/bin/agilex-proxy.sh`
 ProxyCommand are reused as-is), and the NoMachine plist was not touched.
@@ -336,7 +332,7 @@ ssh     41324 <you>    7u  IPv4  ...  TCP 127.0.0.1:5900 (LISTEN)
 $ python3 -c "import socket;s=socket.create_connection(('127.0.0.1',5900),10);print(repr(s.recv(12)))"
 b'RFB 003.008\n'
 
-$ ./bin/robot-vnc.sh --probe
+$ ./scripts/robot-vnc.sh --probe
   banner         : 'RFB 003.008'
   security types : [2]  (2 = VNC password)
   auth           : OK - password accepted
@@ -344,8 +340,8 @@ $ ./bin/robot-vnc.sh --probe
 ```
 
 The banner alone only proves *something* is listening. The probe above goes further:
-it negotiates RFB 3.8, takes the 16-byte challenge, DES-encrypts it with `agx`
-(mirrored-key DES, the VNC scheme) and gets `SecurityResult = 0`, then reads the
+it negotiates RFB 3.8, takes the 16-byte challenge, DES-encrypts it with the
+configured password (mirrored-key DES, the VNC scheme) and gets `SecurityResult = 0`, then reads the
 `ServerInit` that reports the real desktop size and name. `agilex:0` is x11vnc telling
 us it is attached to the session on display `:0`.
 
@@ -390,15 +386,15 @@ recovered after 1s with pid 41324
 
 ### 5.5 The helper script
 
-`bin/robot-vnc.sh` mirrors `bin/robot-desktop.sh`'s style (same `--status`/`--stop`
+`scripts/robot-vnc.sh` mirrors `scripts/robot-desktop.sh`'s style (same `--status`/`--stop`
 shape, same tunnel-through-the-alias reasoning) and adds `--probe`/`--restart`.
-It uses the sibling `bin/rrun.sh` for robot-side checks rather than hand-rolled ssh.
+It uses the configured `ssh` alias for robot-side checks rather than a separate rrun wrapper.
 All modes were exercised except the final `open -a` GUI launch, which was verified
 separately (`open -g -a "/Applications/VNC Viewer.app"` → process
 `/Applications/VNC Viewer.app/Contents/MacOS/vncviewer` came up, then was quit again).
 
 ```
-$ ./bin/robot-vnc.sh --status
+$ ./scripts/robot-vnc.sh --status
 robot reachable  : yes (<robot-ip>)
 launchd agent    : loaded (com.example.agilex-vnc-tunnel)
 ssh tunnel       : listening on 127.0.0.1:5900
@@ -417,7 +413,7 @@ end-to-end RFB   :
 
 * **Not exposed:** x11vnc binds `127.0.0.1` only (`-localhost`). The only route in is
   the SSH tunnel, which is authenticated by the existing `agilex` SSH key.
-* **Password:** `agx`, same as the robot's sudo/SSH password, stored in
+* **Password:** the one you set on the robot (not recorded here), stored in
   `/etc/x11vnc.pass` (8-byte VNC-obfuscated form — note that VNC's DES scheme is
   obfuscation, not real encryption; it is safe here **only** because the port is not
   reachable off-host and the transport is SSH).
@@ -431,19 +427,19 @@ end-to-end RFB   :
 ## 7. Operations & troubleshooting
 
 ```bash
-./bin/robot-vnc.sh --status     # every link: robot, agent, tunnel, service, RFB handshake
-./bin/robot-vnc.sh --probe      # just the end-to-end RFB handshake
-./bin/robot-vnc.sh --restart    # bounce the SSH tunnel
-./bin/robot-vnc.sh --stop       # tear the tunnel down and keep it down
+./scripts/robot-vnc.sh --status     # every link: robot, agent, tunnel, service, RFB handshake
+./scripts/robot-vnc.sh --probe      # just the end-to-end RFB handshake
+./scripts/robot-vnc.sh --restart    # bounce the SSH tunnel
+./scripts/robot-vnc.sh --stop       # tear the tunnel down and keep it down
 ```
 
 | Symptom | Check |
 |---|---|
-| Viewer can't connect | `./bin/robot-vnc.sh --status` — is the tunnel listening? is `x11vnc.service` active? |
-| Tunnel keeps dying | `tail /tmp/agilex-vnc-tunnel.log` — usually the robot's DHCP address moved; `./bin/find-robot.sh` |
-| Tunnel up, handshake fails | `./bin/rrun.sh -c 'systemctl status x11vnc.service'` and `journalctl -u x11vnc.service` |
+| Viewer can't connect | `./scripts/robot-vnc.sh --status` — is the tunnel listening? is `x11vnc.service` active? |
+| Tunnel keeps dying | `tail /tmp/agilex-vnc-tunnel.log` — usually the robot's DHCP address moved; `./scripts/find-robot.sh` |
+| Tunnel up, handshake fails | `./scripts/rrun.sh -c 'systemctl status x11vnc.service'` and `journalctl -u x11vnc.service` |
 | Robot rebooted, no desktop | The unit waits up to 10 min for a graphical login; it starts on its own once someone logs in at the robot |
-| Restart the robot side | `./bin/rsudo.sh -c 'systemctl restart x11vnc.service'` |
+| Restart the robot side | `./scripts/rsudo.sh -c 'systemctl restart x11vnc.service'` |
 
 **First connection after a long idle period:** the very first client connection
 observed during this work took **~9 s** to complete the handshake (journal:
@@ -485,7 +481,7 @@ If the viewer appears to hang on first connect, give it ten seconds.
 `x11vnc` — nothing else.
 
 **Mac:** `~/Library/LaunchAgents/com.example.agilex-vnc-tunnel.plist`,
-`agilex-setup/bin/robot-vnc.sh`, this report.
+`agilex-setup/scripts/robot-vnc.sh`, this report.
 
 **Explicitly untouched:** the NoMachine setup and `com.example.agilex-nx-tunnel.plist`
 (still loaded and running), `~/.ssh/config`, `/home/agilex/.bashrc`,

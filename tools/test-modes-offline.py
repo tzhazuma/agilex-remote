@@ -73,6 +73,17 @@ spec = importlib.util.spec_from_file_location("srv", SERVER)
 srv = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(srv)
 
+# These tests exercise the MOVE C frame sequence itself. MOVE C is disabled by
+# default in production (AGILEX_ENABLE_MOVEC=0); enable it here so the encoding
+# tests can run. The default-off guard has its own tests in
+# tools/test-server-offline.py.
+srv.ENABLE_MOVEC = True
+
+# The fake arm reports an all-zero pose. Production rejects that by default
+# because it cannot be told apart from a silent bus; opt these fixtures in
+# explicitly (the default stays covered elsewhere).
+srv.ALLOW_ZERO_POSE = True
+
 FAIL = []
 
 
@@ -98,6 +109,8 @@ def make_arm():
     a.joints = [10.0] * 6
     a._measured = [10.0] * 6
     a._meas_ok = True
+    a._last_feedback = srv.time.monotonic()
+    a._feedback_fault = False
     a.joints_enabled = [True] * 6
     a.faults = [[] for _ in range(6)]
     a.gripper = 0.0

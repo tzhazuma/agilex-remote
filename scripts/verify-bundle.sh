@@ -9,80 +9,183 @@
 #
 #   ./scripts/verify-bundle.sh              # verify the current tree
 #   ./scripts/verify-bundle.sh foo.zip      # verify a built zip
+#
+# Python: uses $PYTHON or $PY if set, otherwise the first of python3 / python /
+# "py -3" that actually runs. A present-but-broken python3 (the Windows Store
+# stub exits without output) is skipped instead of aborting the check.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-PY="${PYTHON:-${PY:-python3}}"
 FAIL=0
+PY_CMD=()
 
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL + 1)); }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 2; }
 
-WORK="$(mktemp -d -t agilex-verify)"
-trap 'rm -rf "$WORK"' EXIT
+find_python() {
+  local cand
+  if [ -n "${PYTHON:-}" ]; then
+    "$PYTHON" -c 'import sys' >/dev/null 2>&1 || die "PYTHON=$PYTHON does not run"
+    PY_CMD=("$PYTHON"); return
+  fi
+  if [ -n "${PY:-}" ]; then
+    "$PY" -c 'import sys' >/dev/null 2>&1 || die "PY=$PY does not run"
+    PY_CMD=("$PY"); return
+  fi
+  for cand in python3 python; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys' >/dev/null 2>&1; then
+      PY_CMD=("$cand"); return
+    fi
+  done
+  if command -v py >/dev/null 2>&1 && py -3 -c 'import sys' >/dev/null 2>&1; then
+    PY_CMD=(py -3); return
+  fi
+  die "no working python interpreter (tried python3, python, py -3)"
+}
+find_python
+run_py() { "${PY_CMD[@]}" "$@"; }
+
+# Run one shipped test suite, require exit 0 AND at least $3 PASS lines.
+# Windows python3 stubs are already handled by find_python; never call python3
+# directly here. A failure removes BUNDLE VERIFIED via the global FAIL counter.
+run_suite() {
+  local name="$1" script="$2" min="$3" out rc n
+  if [ ! -f "$WORK/$script" ]; then
+    bad "$name: $script missing"
+    return
+  fi
+  set +e
+  out="$(run_py "$WORK/$script" 2>&1)"; rc=$?
+  set -e
+  n="$(printf '%s' "$out" | grep -c '^PASS' || true)"
+  if [ "$rc" -eq 0 ] && [ "${n:-0}" -ge "$min" ]; then
+    ok "$name: $n assertions (minimum $min)"
+  else
+    bad "$name: rc=$rc, $n assertions (minimum $min)"
+    printf '%s\n' "$out" | tail -20
+  fi
+}
+
+# GNU and BSD mktemp disagree about -t. A template ending in X's works on both.
+WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agilex-verify.XXXXXX")" || die "cannot create a temporary directory"
+WORK="$WORK_ROOT"
+trap 'rm -rf "$WORK_ROOT"' EXIT HUP INT TERM
 
 if [ $# -ge 1 ]; then
   echo "== extracting $1 =="
-  unzip -q "$1" -d "$WORK"
+  command -v unzip >/dev/null || die "unzip not found"
+  unzip -q "$1" -d "$WORK_ROOT"
 else
   echo "== copying the working tree =="
   ( cd "$ROOT" && tar -cf - --exclude=.git --exclude='__pycache__' --exclude='*.pyc' . ) \
-    | ( cd "$WORK" && tar -xf - )
+    | ( cd "$WORK_ROOT" && tar -xf - )
+fi
+
+# A delivery zip usually has one top-level directory (02-代码/, agilex-remote/).
+# Descend into it when it is unambiguous, so both layouts verify.
+if [ ! -f "$WORK/server/agilex-remote-server.py" ]; then
+  candidate=""
+  for d in "$WORK_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/server/agilex-remote-server.py" ]; then
+      [ -z "$candidate" ] || { candidate="__multiple__"; break; }
+      candidate="${d%/}"
+    fi
+  done
+  if [ -n "$candidate" ] && [ "$candidate" != "__multiple__" ]; then
+    WORK="$candidate"
+  fi
 fi
 
 echo
 echo "== shipped tree =="
-[ -f "$WORK/server/agilex-remote-server.py" ] && ok "server present" || bad "server missing"
-[ -f "$WORK/server/remote-ui.html" ]          && ok "UI present"     || bad "UI missing"
-[ -f "$WORK/install.sh" ]                     && ok "install.sh present" || bad "install.sh missing"
-[ -x "$WORK/install.sh" ]                     && ok "install.sh executable" || bad "install.sh not executable"
+for f in server/agilex-remote-server.py server/remote-ui.html server/install-server.sh \
+         install.sh scripts/rsudo.sh scripts/agilex-lib.sh scripts/agilex-lease.sh \
+         scripts/scan-secrets.sh scripts/verify-bundle.sh scripts/test-deploy-offline.sh \
+         scripts/test-lease-offline.py tools/test-modes-offline.py \
+         tools/test-server-offline.py tools/test-feedback-control.py tools/test-http-frame-hub.py; do
+  if [ -f "$WORK/$f" ]; then ok "$f present"; else bad "$f missing"; fi
+done
+[ -x "$WORK/install.sh" ] && ok "install.sh executable" || bad "install.sh not executable"
+[ -x "$WORK/server/install-server.sh" ] && ok "install-server.sh executable" || bad "install-server.sh not executable"
+[ -x "$WORK/scripts/rsudo.sh" ] && ok "rsudo.sh executable" || bad "rsudo.sh not executable"
 
 echo
 echo "== python =="
-echo "  interpreter: $("$PY" -c 'import sys; print(sys.executable, sys.version.split()[0])' 2>/dev/null || echo "$PY")"
-if "$PY" -m py_compile "$WORK/server/agilex-remote-server.py" 2>/dev/null; then
+echo "  interpreter: $(run_py -c 'import sys; print(sys.executable, sys.version.split()[0])' 2>/dev/null || echo "${PY_CMD[*]}")"
+if run_py -m py_compile "$WORK/server/agilex-remote-server.py" 2>/dev/null; then
   ok "server compiles"
 else
   bad "server does not compile"
 fi
 
 echo
-echo "== shipped unit tests (this is the part that catches stale files) =="
-if out="$("$PY" "$WORK/tools/test-modes-offline.py" 2>&1)"; then
-  n="$(printf '%s' "$out" | grep -c '^PASS' || true)"
-  ok "offline tests: $n assertions passed"
-  if [ "${n:-0}" -lt 40 ]; then
-    bad "only $n assertions — the regression tests are probably missing"
-  fi
+echo "== shipped test suites (all five must pass; PASS floors catch deletions) =="
+# Test-only switch used by test-deploy's meta-tests. Never set it for a release.
+if [ "${AGILEX_VERIFY_SKIP_SUITES:-0}" = "1" ]; then
+  echo "  NOTE: suite gate skipped by AGILEX_VERIFY_SKIP_SUITES=1"
 else
-  bad "offline tests failed"
-  printf '%s\n' "$out" | tail -15
+  run_suite "mode"     "tools/test-modes-offline.py"    41
+  run_suite "server"   "tools/test-server-offline.py"   148
+  run_suite "feedback" "tools/test-feedback-control.py" 272
+  run_suite "http_hub" "tools/test-http-frame-hub.py"  4
+  run_suite "lease"    "scripts/test-lease-offline.py"  23
+fi
+
+echo
+echo "== deployment / credential tests =="
+if out="$(AGILEX_IN_BUNDLE=1 PYTHON="${PY_CMD[0]}" bash "$WORK/scripts/test-deploy-offline.sh" 2>&1)"; then
+  ok "deployment tests passed"
+else
+  bad "deployment tests failed"
+  printf '%s\n' "$out" | tail -25
 fi
 
 echo
 echo "== shell syntax =="
-for f in "$WORK/install.sh" "$WORK"/scripts/*.sh; do
-  [ -f "$f" ] || continue
-  if bash -n "$f" 2>/dev/null; then ok "$(basename "$f")"; else bad "$(basename "$f")"; fi
-done
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  if bash -n "$f" 2>/dev/null; then ok "${f#"$WORK"/}"; else bad "${f#"$WORK"/}"; fi
+done < <(find "$WORK" -name '*.sh' -type f -not -path '*/.git/*' | sort)
 
 echo
-echo "== secrets =="
-# The Android application id is intentionally retained and disclosed in the
-# README; everything else must be absent.
-hits="$(grep -rIn 'azuma\|tangzh\|tzhazuma' "$WORK" 2>/dev/null \
-        | grep -v 'com\.azuma\.agilexremote' \
-        | grep -v 'com/azuma/agilexremote' \
-        | grep -v 'verify-bundle\.sh' \
-        | grep -v 'package id is' || true)"
-if [ -z "$hits" ]; then ok "no credentials or usernames"; else bad "secret-like strings:"; printf '%s\n' "$hits" | head -5; fi
-ip="$(grep -rIn '10\.20\.[0-9]\{1,3\}\.[0-9]\{1,3\}\|10\.19\.[0-9]\{1,3\}\.[0-9]\{1,3\}' "$WORK" 2>/dev/null || true)"
-if [ -z "$ip" ]; then ok "no real robot/GPU addresses"; else bad "addresses found:"; printf '%s\n' "$ip" | head -5; fi
-if grep -q 'AGILEX_PASSWORD", "changeme"' "$WORK/server/agilex-remote-server.py"; then
-  ok "password default is the placeholder"
+echo "== credentials and addresses =="
+if [ -f "$WORK/scripts/scan-secrets.sh" ]; then
+  if out="$(bash "$WORK/scripts/scan-secrets.sh" --root "$WORK" 2>&1)"; then
+    ok "no hard-coded credentials or real addresses"
+    printf '%s\n' "$out" | grep '^WARN' | sed 's/^/  /' || true
+  else
+    bad "credential/address scan failed"
+    printf '%s\n' "$out" | grep -E '^(FAIL|scan-secrets)' | head -10
+  fi
 else
-  bad "password default is not 'changeme'"
+  bad "scan-secrets.sh missing"
+fi
+
+echo
+echo "== installer consistency =="
+if grep -q 'EnvironmentFile=-' "$WORK/server/install-server.sh" 2>/dev/null; then
+  bad "install-server.sh still has an optional EnvironmentFile"
+else
+  ok "EnvironmentFile is mandatory"
+fi
+if grep -q 'AGILEX_ALLOW_ANON=0' "$WORK/server/install-server.sh"; then
+  ok "install-server.sh pins AGILEX_ALLOW_ANON=0"
+else
+  bad "install-server.sh does not pin AGILEX_ALLOW_ANON=0"
+fi
+if grep -q 'server/install-server.sh' "$WORK/install.sh"; then
+  ok "install.sh delegates to install-server.sh (one unit definition)"
+else
+  bad "install.sh duplicates the robot-side install"
+fi
+if grep -q 'AGILEX_PASSWORD", "changeme"' "$WORK/server/agilex-remote-server.py"; then
+  warn "server code still has the built-in 'changeme' default (out of scope); installers override it and fail closed"
+else
+  ok "server code has no built-in password default"
 fi
 
 echo
